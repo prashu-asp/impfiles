@@ -80,3 +80,125 @@ for i, gt_lbl in enumerate(gt_labels):
             pred_labels.pop(j)   # remove matched prediction
             pred_masks.pop(j)    # remove its mask too
             break  # move to next GT
+‐--------
+
+
+import numpy as np
+from collections import defaultdict
+import pandas as pd
+
+
+def polygon_to_bbox(poly_points: str):
+    """
+    Convert polygon string 'x1,y1;x2,y2;...' → bounding box [x_min, y_min, x_max, y_max].
+    """
+    coords = [list(map(float, p.split(','))) for p in poly_points.split(';')]
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def compute_iou_bbox(box1, box2):
+    """
+    Compute IoU between two bounding boxes [x1,y1,x2,y2].
+    """
+    xA = max(box1[0], box2[0])
+    yA = max(box1[1], box2[1])
+    xB = min(box1[2], box2[2])
+    yB = min(box1[3], box2[3])
+
+    inter_area = max(0, xB - xA) * max(0, yB - yA)
+    box1_area = (box1[2]-box1[0]) * (box1[3]-box1[1])
+    box2_area = (box2[2]-box2[0]) * (box2[3]-box2[1])
+    union_area = box1_area + box2_area - inter_area
+
+    return inter_area / union_area if union_area > 0 else 0.0
+
+
+def evaluate_image_bbox(gt_labels, gt_polygons, pred_labels, pred_bboxes, iou_thresh=0.5):
+    """
+    Evaluate one image:
+    - GT polygons → bboxes
+    - Compare with predicted bboxes
+    - Count per-class gt, detected, false positives
+    """
+    gt_bboxes = [polygon_to_bbox(poly) for poly in gt_polygons]
+    per_class = defaultdict(lambda: {"gt": 0, "detected": 0, "false_positives": 0})
+
+    # Count GT occurrences
+    for lbl in gt_labels:
+        per_class[lbl]["gt"] += 1
+
+    # Work on copies so we can safely remove matched predictions
+    pred_labels_copy = pred_labels.copy()
+    pred_bboxes_copy = pred_bboxes.copy()
+
+    # Match GT → Pred
+    for i, gt_lbl in enumerate(gt_labels):
+        for j in reversed(range(len(pred_labels_copy))):  # iterate backwards to pop safely
+            if compute_iou_bbox(gt_bboxes[i], pred_bboxes_copy[j]) >= iou_thresh and gt_lbl == pred_labels_copy[j]:
+                per_class[gt_lbl]["detected"] += 1
+                pred_labels_copy.pop(j)
+                pred_bboxes_copy.pop(j)
+                break  # stop after first match for this GT
+
+    # Remaining predictions → false positives
+    for lbl in pred_labels_copy:
+        per_class[lbl]["false_positives"] += 1
+
+    return per_class
+
+
+def evaluate_dataset_bbox(gt_data, pred_data, iou_thresh=0.5):
+    """
+    Evaluate dataset:
+    - gt_data: list of dicts with {"img", "labels", "polygons"}
+    - pred_data: list of dicts with {"img", "labels", "bboxes"}
+    """
+    overall = defaultdict(lambda: {"gt": 0, "detected": 0, "false_positives": 0})
+
+    for gt, pred in zip(gt_data, pred_data):
+        per_img = evaluate_image_bbox(
+            gt["labels"], gt["polygons"],
+            pred["labels"], pred["bboxes"],
+            iou_thresh=iou_thresh
+        )
+        for cls, vals in per_img.items():
+            overall[cls]["gt"] += vals["gt"]
+            overall[cls]["detected"] += vals["detected"]
+            overall[cls]["false_positives"] += vals["false_positives"]
+
+    return dict(overall)
+
+
+# ---------------- Example Usage ---------------- #
+
+if __name__ == "__main__":
+    gt_data = [
+        {
+            "img": "img1",
+            "labels": ["table", "cup"],
+            "polygons": [
+                "10,10;50,10;50,50;10,50",   # table polygon
+                "60,60;70,60;70,70;60,70"    # cup polygon
+            ]
+        }
+    ]
+
+    pred_data = [
+        {
+            "img": "img1",
+            "labels": ["table", "cup", "cup"],
+            "bboxes": [
+                [10, 10, 50, 50],  # table
+                [60, 60, 70, 70],  # cup (good)
+                [61, 61, 71, 71]   # extra false-positive cup
+            ]
+        }
+    ]
+
+    results = evaluate_dataset_bbox(gt_data, pred_data, iou_thresh=0.5)
+
+    # Convert to DataFrame for readability
+    df = pd.DataFrame.from_dict(results, orient="index")
+    print(df)
