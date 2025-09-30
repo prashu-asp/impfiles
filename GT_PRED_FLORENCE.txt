@@ -1,0 +1,72 @@
+import numpy as np
+from collections import defaultdict
+
+def compute_iou(mask1, mask2):
+    """Compute IoU between two binary masks."""
+    inter = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+    return inter / union if union > 0 else 0.0
+
+
+def evaluate_image(gt_labels, gt_masks, pred_labels, pred_masks, iou_thresh=0.5):
+    """
+    For each GT object:
+      - Count total GT occurrences.
+      - Mark detected if any prediction overlaps with IoU >= threshold and label matches (break after first match).
+    Also count false positives for predictions that never matched any GT.
+    Returns per-class stats {cls: {"gt": n, "detected": m, "false_positives": f}}
+    """
+    n_gt, n_pred = len(gt_masks), len(pred_masks)
+    iou_matrix = np.zeros((n_gt, n_pred), dtype=float)
+
+    # IoU matrix
+    for i in range(n_gt):
+        for j in range(n_pred):
+            iou_matrix[i, j] = compute_iou(gt_masks[i], pred_masks[j])
+
+    per_class = defaultdict(lambda: {"gt": 0, "detected": 0, "false_positives": 0})
+
+    # Count GT occurrences
+    for lbl in gt_labels:
+        per_class[lbl]["gt"] += 1
+
+    # Track matched predictions
+    matched_preds = set()
+
+    # For each GT → check all preds, break after first valid match
+    for i, gt_lbl in enumerate(gt_labels):
+        for j, pred_lbl in enumerate(pred_labels):
+            if iou_matrix[i, j] >= iou_thresh and gt_lbl == pred_lbl:
+                per_class[gt_lbl]["detected"] += 1
+                matched_preds.add(j)  # mark this pred as used
+                break
+
+    # Any unmatched predictions → false positives
+    for j, pred_lbl in enumerate(pred_labels):
+        if j not in matched_preds:
+            per_class[pred_lbl]["false_positives"] += 1
+
+    return per_class
+
+
+def evaluate_dataset(gt_data, pred_data, iou_thresh=0.5):
+    """
+    Dataset-level evaluation.
+    gt_data / pred_data: list of dicts
+      GT example:   {"img":"abc.jpg","labels":["table","chair"],"masks":[mask1, mask2]}
+      Pred example: {"img":"abc.jpg","labels":["table","sofa"],"masks":[maskA, maskB]}
+    """
+    overall = defaultdict(lambda: {"gt": 0, "detected": 0, "false_positives": 0})
+
+    for gt, pred in zip(gt_data, pred_data):
+        per_img = evaluate_image(
+            gt["labels"], gt["masks"],
+            pred["labels"], pred["masks"],
+            iou_thresh=iou_thresh
+        )
+        for cls, vals in per_img.items():
+            overall[cls]["gt"] += vals["gt"]
+            overall[cls]["detected"] += vals["detected"]
+            overall[cls]["false_positives"] += vals["false_positives"]
+
+    return dict(overall)
