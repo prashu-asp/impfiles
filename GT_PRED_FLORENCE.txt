@@ -4,61 +4,130 @@ from ultralytics import YOLO
 # Load YOLO
 y = YOLO("yolov8n.pt")
 model = y.model  # DetectionModel
+layers = model.model 
 
-# Create dummy input
-img = torch.randn(1, 3, 640, 640)
-
-# ---------------------------------------------------------
-# 1. Run normal YOLO forward (for comparison)
-# ---------------------------------------------------------
-normal_out = model(img)
-print("Normal YOLO output OK")
+from PIL import Image
+import torchvision.transforms as T
+import numpy as np
 
 # ---------------------------------------------------------
-# 2. Run backbone ONLY
+# Load a real image (BGR/RGB)
 # ---------------------------------------------------------
-# YOLO backbone is always model.model[0] in all v8 versions
-backbone = model.model[0]
 
-with torch.no_grad():
-    feats = backbone(img)   # may be list/tuple or a single tensor
-
-# If backbone returns more than 3 feature maps, take last 3
-if isinstance(feats, (list, tuple)):
-    if len(feats) >= 3:
-        p3, p4, p5 = feats[-3:]
-    else:
-        raise RuntimeError("Backbone returned fewer than 3 feature maps.")
-else:
-    raise RuntimeError("Backbone did not return multi-scale features!")
-
-print("Extracted P3:", p3.shape)
-print("Extracted P4:", p4.shape)
-print("Extracted P5:", p5.shape)
+def pil_to_tensor(pil_img, size=(640, 640)):
+    pil_img = pil_img.resize(size)
+    img_list = list(pil_img.getdata())  # pure Python list
+    img_tensor = torch.tensor(img_list, dtype=torch.uint8)
+    img_tensor = img_tensor.view(size[1], size[0], 3)  # H,W,C
+    img_tensor = img_tensor.permute(2,0,1).float() / 255.0  # C,H,W
+    return img_tensor.unsqueeze(0)  # [1,3,640,640]
 
 # ---------------------------------------------------------
-# 3. Send P3,P4,P5 to neck + head manually
+# Load image
 # ---------------------------------------------------------
-neck_and_head = model.model[1:]  # everything except backbone
-
-x = [p3, p4, p5]
-
-for m in neck_and_head:
-    try:
-        x = m(x)
-    except:
-        # some modules expect unpacked list
-        x = m(*x) if isinstance(x, (list, tuple)) else m(x)
-
-manual_out = x
-print("Manual output OK")
+img_path = "F://images_gemini//images_gemini//juice//RGB//black_bright_orange_316663703505.png"   # CHANGE THIS
+img = Image.open(img_path).convert("RGB")
+x = pil_to_tensor(img)
+# x = torch.randn(1, 3, 640, 640)
 
 # ---------------------------------------------------------
-# 4. Compare output types/shapes
+# Get YOLO normal prediction (for comparison)
 # ---------------------------------------------------------
-print("Normal out type:", type(normal_out))
-print("Manual out type:", type(manual_out))
+preds_normal = model(x)[0]   # YOLO forward
 
-if isinstance(manual_out, torch.Tensor) and isinstance(normal_out, torch.Tensor):
-    print("Normal out shape:", normal_out.shape)
-    print("Manual out shape:", manual_out.shape)
+print("Normal YOLO prediction shape:", preds_normal.shape)
+
+# ---------------------------------------------------------
+# 1. Extract P3, P4, P5 using hooks
+# ---------------------------------------------------------
+P3_layer = 4
+P4_layer = 6
+P5_layer = 9
+
+P3 = None
+P4 = None
+P5 = None
+
+def hook_p3(m, inp, out):
+    global P3
+    P3 = out
+
+def hook_p4(m, inp, out):
+    global P4
+    P4 = out
+
+def hook_p5(m, inp, out):
+    global P5
+    P5 = out
+
+hooks = []
+hooks.append(layers[P3_layer].register_forward_hook(hook_p3))
+hooks.append(layers[P4_layer].register_forward_hook(hook_p4))
+hooks.append(layers[P5_layer].register_forward_hook(hook_p5))
+
+# Run backbone forward
+_ = model(x)
+
+for h in hooks:
+    h.remove()
+
+print("Extracted:")
+print("P3:", P3.shape)
+print("P4:", P4.shape)
+print("P5:", P5.shape)
+
+# ---------------------------------------------------------
+# 2. Replicate neck manually (layers 10 → 21)
+# ---------------------------------------------------------
+
+upsample1 = layers[10]
+concat1   = layers[11]
+c2f1      = layers[12]
+upsample2 = layers[13]
+concat2   = layers[14]
+c2f2      = layers[15]
+down1     = layers[16]
+concat3   = layers[17]
+c2f3      = layers[18]
+down2     = layers[19]
+concat4   = layers[20]
+c2f4      = layers[21]
+detect    = layers[22]
+
+# ----- FPN path -----
+P5_up = upsample1(P5)
+F4 = concat1([P5_up, P4])
+P4_out = c2f1(F4)
+
+P4_up = upsample2(P4_out)
+F3 = concat2([P4_up, P3])
+P3_out = c2f2(F3)
+
+# ----- PAN path -----
+P3_down = down1(P3_out)
+F4b = concat3([P3_down, P4_out])
+P4b = c2f3(F4b)
+
+P4_down = down2(P4b)
+F5 = concat4([P4_down, P5])
+P5b = c2f4(F5)
+
+# Final features (like YOLO neck output)
+neck_out = [P3_out, P4b, P5b]
+
+# ---------------------------------------------------------
+# 3. Detect head
+# ---------------------------------------------------------
+preds_manual = detect(neck_out)[0]
+
+print("Manual prediction shape:", preds_manual.shape)
+
+# ---------------------------------------------------------
+# 4. Compare
+# ---------------------------------------------------------
+print("\nComparison:")
+print("Normal:", preds_normal.shape,preds_normal)
+print("Manual:", preds_manual.shape,preds_manual)
+
+# Shapes should match exactly
+
