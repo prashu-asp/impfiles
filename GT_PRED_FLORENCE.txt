@@ -1,204 +1,64 @@
-import numpy as np
-from collections import defaultdict
+import torch
+from ultralytics import YOLO
 
-def compute_iou(mask1, mask2):
-    """Compute IoU between two binary masks."""
-    inter = np.logical_and(mask1, mask2).sum()
-    union = np.logical_or(mask1, mask2).sum()
-    return inter / union if union > 0 else 0.0
+# Load YOLO
+y = YOLO("yolov8n.pt")
+model = y.model  # DetectionModel
 
+# Create dummy input
+img = torch.randn(1, 3, 640, 640)
 
-def evaluate_image(gt_labels, gt_masks, pred_labels, pred_masks, iou_thresh=0.5):
-    """
-    For each GT object:
-      - Count total GT occurrences.
-      - Mark detected if any prediction overlaps with IoU >= threshold and label matches (break after first match).
-    Also count false positives for predictions that never matched any GT.
-    Returns per-class stats {cls: {"gt": n, "detected": m, "false_positives": f}}
-    """
-    n_gt, n_pred = len(gt_masks), len(pred_masks)
-    iou_matrix = np.zeros((n_gt, n_pred), dtype=float)
+# ---------------------------------------------------------
+# 1. Run normal YOLO forward (for comparison)
+# ---------------------------------------------------------
+normal_out = model(img)
+print("Normal YOLO output OK")
 
-    # IoU matrix
-    for i in range(n_gt):
-        for j in range(n_pred):
-            iou_matrix[i, j] = compute_iou(gt_masks[i], pred_masks[j])
+# ---------------------------------------------------------
+# 2. Run backbone ONLY
+# ---------------------------------------------------------
+# YOLO backbone is always model.model[0] in all v8 versions
+backbone = model.model[0]
 
-    per_class = defaultdict(lambda: {"gt": 0, "detected": 0, "false_positives": 0})
+with torch.no_grad():
+    feats = backbone(img)   # may be list/tuple or a single tensor
 
-    # Count GT occurrences
-    for lbl in gt_labels:
-        per_class[lbl]["gt"] += 1
+# If backbone returns more than 3 feature maps, take last 3
+if isinstance(feats, (list, tuple)):
+    if len(feats) >= 3:
+        p3, p4, p5 = feats[-3:]
+    else:
+        raise RuntimeError("Backbone returned fewer than 3 feature maps.")
+else:
+    raise RuntimeError("Backbone did not return multi-scale features!")
 
-    # Track matched predictions
-    matched_preds = set()
+print("Extracted P3:", p3.shape)
+print("Extracted P4:", p4.shape)
+print("Extracted P5:", p5.shape)
 
-    # For each GT → check all preds, break after first valid match
-    for i, gt_lbl in enumerate(gt_labels):
-        for j, pred_lbl in enumerate(pred_labels):
-            if iou_matrix[i, j] >= iou_thresh and gt_lbl == pred_lbl:
-                per_class[gt_lbl]["detected"] += 1
-                matched_preds.add(j)  # mark this pred as used
-                break
+# ---------------------------------------------------------
+# 3. Send P3,P4,P5 to neck + head manually
+# ---------------------------------------------------------
+neck_and_head = model.model[1:]  # everything except backbone
 
-    # Any unmatched predictions → false positives
-    for j, pred_lbl in enumerate(pred_labels):
-        if j not in matched_preds:
-            per_class[pred_lbl]["false_positives"] += 1
+x = [p3, p4, p5]
 
-    return per_class
+for m in neck_and_head:
+    try:
+        x = m(x)
+    except:
+        # some modules expect unpacked list
+        x = m(*x) if isinstance(x, (list, tuple)) else m(x)
 
+manual_out = x
+print("Manual output OK")
 
-def evaluate_dataset(gt_data, pred_data, iou_thresh=0.5):
-    """
-    Dataset-level evaluation.
-    gt_data / pred_data: list of dicts
-      GT example:   {"img":"abc.jpg","labels":["table","chair"],"masks":[mask1, mask2]}
-      Pred example: {"img":"abc.jpg","labels":["table","sofa"],"masks":[maskA, maskB]}
-    """
-    overall = defaultdict(lambda: {"gt": 0, "detected": 0, "false_positives": 0})
+# ---------------------------------------------------------
+# 4. Compare output types/shapes
+# ---------------------------------------------------------
+print("Normal out type:", type(normal_out))
+print("Manual out type:", type(manual_out))
 
-    for gt, pred in zip(gt_data, pred_data):
-        per_img = evaluate_image(
-            gt["labels"], gt["masks"],
-            pred["labels"], pred["masks"],
-            iou_thresh=iou_thresh
-        )
-        for cls, vals in per_img.items():
-            overall[cls]["gt"] += vals["gt"]
-            overall[cls]["detected"] += vals["detected"]
-            overall[cls]["false_positives"] += vals["false_positives"]
-
-    return dict(overall)
-
---------------------------
-
-for i, gt_lbl in enumerate(gt_labels):
-    for j in reversed(range(len(pred_labels))):  # iterate backwards
-        if compute_iou(gt_masks[i], pred_masks[j]) >= iou_thresh and gt_lbl == pred_labels[j]:
-            per_class[gt_lbl]["detected"] += 1
-            pred_labels.pop(j)   # remove matched prediction
-            pred_masks.pop(j)    # remove its mask too
-            break  # move to next GT
-‐--------
-
-
-import numpy as np
-from collections import defaultdict
-import pandas as pd
-
-
-def polygon_to_bbox(poly_points: str):
-    """
-    Convert polygon string 'x1,y1;x2,y2;...' → bounding box [x_min, y_min, x_max, y_max].
-    """
-    coords = [list(map(float, p.split(','))) for p in poly_points.split(';')]
-    xs = [c[0] for c in coords]
-    ys = [c[1] for c in coords]
-    return [min(xs), min(ys), max(xs), max(ys)]
-
-
-def compute_iou_bbox(box1, box2):
-    """
-    Compute IoU between two bounding boxes [x1,y1,x2,y2].
-    """
-    xA = max(box1[0], box2[0])
-    yA = max(box1[1], box2[1])
-    xB = min(box1[2], box2[2])
-    yB = min(box1[3], box2[3])
-
-    inter_area = max(0, xB - xA) * max(0, yB - yA)
-    box1_area = (box1[2]-box1[0]) * (box1[3]-box1[1])
-    box2_area = (box2[2]-box2[0]) * (box2[3]-box2[1])
-    union_area = box1_area + box2_area - inter_area
-
-    return inter_area / union_area if union_area > 0 else 0.0
-
-
-def evaluate_image_bbox(gt_labels, gt_polygons, pred_labels, pred_bboxes, iou_thresh=0.5):
-    """
-    Evaluate one image:
-    - GT polygons → bboxes
-    - Compare with predicted bboxes
-    - Count per-class gt, detected, false positives
-    """
-    gt_bboxes = [polygon_to_bbox(poly) for poly in gt_polygons]
-    per_class = defaultdict(lambda: {"gt": 0, "detected": 0, "false_positives": 0})
-
-    # Count GT occurrences
-    for lbl in gt_labels:
-        per_class[lbl]["gt"] += 1
-
-    # Work on copies so we can safely remove matched predictions
-    pred_labels_copy = pred_labels.copy()
-    pred_bboxes_copy = pred_bboxes.copy()
-
-    # Match GT → Pred
-    for i, gt_lbl in enumerate(gt_labels):
-        for j in reversed(range(len(pred_labels_copy))):  # iterate backwards to pop safely
-            if compute_iou_bbox(gt_bboxes[i], pred_bboxes_copy[j]) >= iou_thresh and gt_lbl == pred_labels_copy[j]:
-                per_class[gt_lbl]["detected"] += 1
-                pred_labels_copy.pop(j)
-                pred_bboxes_copy.pop(j)
-                break  # stop after first match for this GT
-
-    # Remaining predictions → false positives
-    for lbl in pred_labels_copy:
-        per_class[lbl]["false_positives"] += 1
-
-    return per_class
-
-
-def evaluate_dataset_bbox(gt_data, pred_data, iou_thresh=0.5):
-    """
-    Evaluate dataset:
-    - gt_data: list of dicts with {"img", "labels", "polygons"}
-    - pred_data: list of dicts with {"img", "labels", "bboxes"}
-    """
-    overall = defaultdict(lambda: {"gt": 0, "detected": 0, "false_positives": 0})
-
-    for gt, pred in zip(gt_data, pred_data):
-        per_img = evaluate_image_bbox(
-            gt["labels"], gt["polygons"],
-            pred["labels"], pred["bboxes"],
-            iou_thresh=iou_thresh
-        )
-        for cls, vals in per_img.items():
-            overall[cls]["gt"] += vals["gt"]
-            overall[cls]["detected"] += vals["detected"]
-            overall[cls]["false_positives"] += vals["false_positives"]
-
-    return dict(overall)
-
-
-# ---------------- Example Usage ---------------- #
-
-if __name__ == "__main__":
-    gt_data = [
-        {
-            "img": "img1",
-            "labels": ["table", "cup"],
-            "polygons": [
-                "10,10;50,10;50,50;10,50",   # table polygon
-                "60,60;70,60;70,70;60,70"    # cup polygon
-            ]
-        }
-    ]
-
-    pred_data = [
-        {
-            "img": "img1",
-            "labels": ["table", "cup", "cup"],
-            "bboxes": [
-                [10, 10, 50, 50],  # table
-                [60, 60, 70, 70],  # cup (good)
-                [61, 61, 71, 71]   # extra false-positive cup
-            ]
-        }
-    ]
-
-    results = evaluate_dataset_bbox(gt_data, pred_data, iou_thresh=0.5)
-
-    # Convert to DataFrame for readability
-    df = pd.DataFrame.from_dict(results, orient="index")
-    print(df)
+if isinstance(manual_out, torch.Tensor) and isinstance(normal_out, torch.Tensor):
+    print("Normal out shape:", normal_out.shape)
+    print("Manual out shape:", manual_out.shape)
