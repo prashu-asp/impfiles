@@ -1,46 +1,162 @@
+# train_custom_yolotxt_v8loss.py
 import argparse
 import os
+import time
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-import glob
-import numpy as np
 
 from ultralytics import YOLO
-from utils.loss import v8DetectionLoss   # Your official utils/loss.py
+
+# Import the official v8DetectionLoss you placed in utils/loss.py
+# (adapt import if you placed file elsewhere)
+from utils.loss import v8DetectionLoss
 
 
-# ============================================================
-# Custom YOLO model with manual backbone → neck → detect
-# ============================================================
+# ---------------------------
+# Utility: PIL -> tensor without numpy
+# ---------------------------
+def pil_to_tensor_uint8(pil_img, size=(640, 640)):
+    """
+    Convert PIL image -> torch tensor [3,H,W], values in [0,1], WITHOUT numpy.
+    """
+    pil_img = pil_img.resize(size)
+    pixels = list(pil_img.getdata())  # list of (R,G,B)
+    t = torch.tensor(pixels, dtype=torch.uint8)  # (H*W, 3)
+    t = t.view(size[1], size[0], 3)  # H, W, C
+    t = t.permute(2, 0, 1).float() / 255.0  # C,H,W float
+    return t
 
-class CustomYOLO(nn.Module):
-    def __init__(self, ckpt_path):
+
+# ---------------------------
+# Dataset: YOLO TXT format
+# ---------------------------
+class YOLOTxtDataset(Dataset):
+    """
+    images_dir: folder containing image files (.jpg/.png)
+    labels_dir: folder containing matching .txt files (same stem). Each line: cls x y w h (normalized 0..1)
+    """
+    def __init__(self, images_dir: str, labels_dir: str, imgsz: int = 640, exts=(".jpg", ".png", ".jpeg")):
         super().__init__()
-        y = YOLO(ckpt_path)
-        self.model = y.model
+        self.imgsz = imgsz
+        images_dir = Path(images_dir)
+        self.image_paths = sorted([p for p in images_dir.iterdir() if p.suffix.lower() in exts])
+        self.labels_dir = Path(labels_dir)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def load_image(self, p: Path):
+        img = Image.open(p).convert("RGB")
+        return pil_to_tensor_uint8(img, size=(self.imgsz, self.imgsz))
+
+    def load_labels(self, img_path: Path):
+        lbl_path = self.labels_dir / (img_path.stem + ".txt")
+        if not lbl_path.exists():
+            return torch.zeros((0, 5), dtype=torch.float32)
+        rows = []
+        with open(lbl_path, "r") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                parts = ln.split()
+                if len(parts) < 5:
+                    continue
+                cls = float(parts[0])
+                x = float(parts[1])
+                y = float(parts[2])
+                w = float(parts[3])
+                h = float(parts[4])
+                rows.append([cls, x, y, w, h])
+        if len(rows) == 0:
+            return torch.zeros((0, 5), dtype=torch.float32)
+        return torch.tensor(rows, dtype=torch.float32)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        img = self.load_image(img_path)
+        labels = self.load_labels(img_path)
+        return img, labels, str(img_path)
+
+
+# ---------------------------
+# Collate to produce targets as v8DetectionLoss expects
+# returns imgs_tensor, targets_dict
+# targets_dict contains:
+#   "batch_idx": (N,) long
+#   "cls": (N,) long
+#   "bboxes": (N,4) float (xywh normalized)
+# ---------------------------
+def collate_fn(batch):
+    imgs = []
+    batch_idx_list = []
+    cls_list = []
+    bboxes_list = []
+
+    for bi, (img, labels, path) in enumerate(batch):
+        imgs.append(img)
+        if labels.numel() == 0:
+            continue
+        # labels shape (n,5): cls, x, y, w, h
+        n = labels.shape[0]
+        batch_idx_list.append(torch.full((n,), bi, dtype=torch.long))
+        cls_list.append(labels[:, 0].long())
+        bboxes_list.append(labels[:, 1:5].float())
+
+    imgs_t = torch.stack(imgs)  # B,3,H,W
+
+    if len(bboxes_list) == 0:
+        return imgs_t, {
+            "batch_idx": torch.zeros((0,), dtype=torch.long),
+            "cls": torch.zeros((0,), dtype=torch.long),
+            "bboxes": torch.zeros((0, 4), dtype=torch.float32),
+        }
+
+    targets = {
+        "batch_idx": torch.cat(batch_idx_list),
+        "cls": torch.cat(cls_list),
+        "bboxes": torch.cat(bboxes_list),
+    }
+    return imgs_t, targets
+
+
+# ---------------------------
+# Custom model wrapper: manual backbone -> neck -> detect
+# returns preds only (loss computed in training loop to handle return format)
+# ---------------------------
+class CustomYOLO(nn.Module):
+    def __init__(self, weights_path: str):
+        super().__init__()
+        y = YOLO(weights_path)
+        self.model = y.model  # DetectionModel
         self.layers = self.model.model
         self.names = self.model.names
 
+        # Official v8DetectionLoss expects the model object
         self.criterion = v8DetectionLoss(self.model)
 
-    def forward(self, x, targets=None):
+    def forward(self, x):
         layers = self.layers
-
-        # --------------------- BACKBONE OUTPUTS ---------------------
+        # backbone 0..9
         P3 = P4 = P5 = None
+        xi = x
         for i, m in enumerate(layers):
-            x = m(x)
-            if i == 4: P3 = x
-            if i == 6: P4 = x
+            xi = m(xi)
+            if i == 4:
+                P3 = xi
+            if i == 6:
+                P4 = xi
             if i == 9:
-                P5 = x
+                P5 = xi
                 break
 
-        # ---------- (OPTIONAL) Add IR fusion here -----------
+        # optional fusion point here if needed later
 
-        # ---------------------- NECK -------------------------
+        # neck 10..21 manual replication
         P5_up = layers[10](P5)
         F4 = layers[11]([P5_up, P4])
         P4_out = layers[12](F4)
@@ -57,155 +173,91 @@ class CustomYOLO(nn.Module):
         F5b = layers[20]([P4_down, P5])
         P5b = layers[21](F5b)
 
-        # ---------------------- DETECT HEAD -------------------------
         detect = layers[22]
         preds = detect([P3_out, P4b, P5b])
 
-        if targets is None:
-            return preds
-
-        total_loss, loss_items = self.criterion(preds, targets)
-        return preds, total_loss, loss_items
+        return preds
 
 
-# ============================================================
-# Custom YOLO TXT Dataset Loader
-# ============================================================
-
-class YOLOTxtDataset(Dataset):
-    def __init__(self, images_dir, img_size=640):
-        super().__init__()
-        self.img_size = img_size
-        self.image_paths = sorted(glob.glob(os.path.join(images_dir, "*.jpg")) +
-                                  glob.glob(os.path.join(images_dir, "*.png")))
-
-        self.label_paths = [
-            p.replace("images", "labels").replace(".jpg", ".txt").replace(".png", ".txt")
-            for p in self.image_paths
-        ]
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def load_image(self, path):
-        img = Image.open(path).convert("RGB")
-        img = img.resize((self.img_size, self.img_size))
-        img = np.array(img).astype(np.float32) / 255.0
-        img = torch.from_numpy(img).permute(2, 0, 1)   # HWC → CHW
-        return img
-
-    def load_labels(self, label_path):
-        if not os.path.exists(label_path):
-            return torch.zeros((0, 5), dtype=torch.float32)
-
-        labels = []
-        with open(label_path, "r") as f:
-            for line in f.readlines():
-                cls, x, y, w, h = map(float, line.strip().split())
-                labels.append([cls, x, y, w, h])
-
-        return torch.tensor(labels, dtype=torch.float32)
-
-    def __getitem__(self, idx):
-        img = self.load_image(self.image_paths[idx])
-        labels = self.load_labels(self.label_paths[idx])
-
-        return img, labels, idx
-
-
-# ============================================================
-# Collate function for YOLO loss formatting
-# ============================================================
-
-def collate_fn(batch):
-    imgs = []
-    batch_idx = []
-    cls = []
-    bboxes = []
-
-    for b_i, (img, labels, idx) in enumerate(batch):
-        imgs.append(img)
-
-        if len(labels) > 0:
-            batch_idx.append(torch.full((len(labels),), b_i, dtype=torch.long))
-            cls.append(labels[:, 0].long())
-            bboxes.append(labels[:, 1:5])
-        else:
-            # no labels in this image
-            pass
-
-    if len(bboxes) == 0:
-        return torch.stack(imgs), {
-            "batch_idx": torch.zeros((0,), dtype=torch.long),
-            "cls": torch.zeros((0,), dtype=torch.long),
-            "bboxes": torch.zeros((0, 4), dtype=torch.float32)
-        }
-
-    return (
-        torch.stack(imgs),
-        {
-            "batch_idx": torch.cat(batch_idx),
-            "cls": torch.cat(cls),
-            "bboxes": torch.cat(bboxes)
-        }
-    )
-
-
-# ============================================================
-# Training Loop
-# ============================================================
-
+# ---------------------------
+# Training loop
+# ---------------------------
 def train(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.device if torch.cuda.is_available() and "cuda" in args.device else ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[info] device = {device}")
 
+    # dataset and dataloader
+    ds = YOLOTxtDataset(args.train_dir, labels_dir=args.labels_dir, imgsz=args.img)
+    dl = DataLoader(ds, batch_size=args.batch, shuffle=True, collate_fn=collate_fn, num_workers=0)
+
+    # model
     model = CustomYOLO(args.weights).to(device)
-
-    dataset = YOLOTxtDataset(args.train, img_size=args.img)
-    loader = DataLoader(dataset,
-                        batch_size=args.batch,
-                        shuffle=True,
-                        collate_fn=collate_fn)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    for epoch in range(args.epochs):
-        print(f"\n=== Epoch {epoch+1}/{args.epochs} ===")
+    start_time = time.time()
+    model.train()
 
-        for imgs, t in loader:
+    for epoch in range(1, args.epochs + 1):
+        epoch_loss = 0.0
+        n_batches = 0
+        t0 = time.time()
+        print(f"\n--- Epoch {epoch}/{args.epochs} ---")
+
+        for imgs, targets in dl:
             imgs = imgs.to(device)
-            targets = {k: v.to(device) for k, v in t.items()}
+            # build device targets dict
+            tgt = {k: v.to(device) for k, v in targets.items()}
 
-            preds, loss, loss_items = model(imgs, targets)
+            preds = model(imgs)
+
+            # v8DetectionLoss returns: (loss_vector * batch_size, loss.detach())
+            loss_vec_scaled, loss_items = model.criterion(preds, tgt)
+
+            # Convert to scalar for backward:
+            # loss_vec_scaled is a tensor with 3 elements (box,cls,dfl) scaled by batch_size
+            loss_scalar = loss_vec_scaled.sum()
 
             optimizer.zero_grad()
-            loss.backward()
+            loss_scalar.backward()
             optimizer.step()
 
-            print(
-                f"loss:{loss.item():.4f}  "
-                f"box:{loss_items[0].item():.4f}  "
-                f"cls:{loss_items[1].item():.4f}  "
-                f"dfl:{loss_items[2].item():.4f}"
-            )
+            epoch_loss += float(loss_scalar.item())
+            n_batches += 1
+
+            box_loss = float(loss_items[0].item())
+            cls_loss = float(loss_items[1].item())
+            dfl_loss = float(loss_items[2].item())
+
+            print(f"batch {n_batches}  loss:{loss_scalar.item():.4f}  box:{box_loss:.4f}  cls:{cls_loss:.4f}  dfl:{dfl_loss:.4f}")
+
+        avg_loss = epoch_loss / max(1, n_batches)
+        print(f"Epoch {epoch} done in {(time.time() - t0):.1f}s  avg_loss={avg_loss:.4f}")
+
+        # save checkpoint each epoch
+        ckpt_path = f"custom_yolo_epoch{epoch}.pt"
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"[info] saved checkpoint {ckpt_path}")
+
+    total_time = time.time() - start_time
+    print(f"Training finished in {total_time/60:.2f} minutes")
 
 
-# ============================================================
-# Argument Parser
-# ============================================================
-
-def get_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--train", type=str, required=True, help="path to train/images folder")
-    parser.add_argument("--weights", type=str, default="yolov8n.pt")
-    parser.add_argument("--img", type=int, default=640)
-    parser.add_argument("--batch", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-4)
-
-    return parser.parse_args()
+# ---------------------------
+# Argument parser
+# ---------------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--train_dir", required=True, help="path to images folder for training")
+    p.add_argument("--labels_dir", required=True, help="path to labels folder (txt files)")
+    p.add_argument("--weights", default="yolov8n.pt", help="path to yolov8 weights .pt")
+    p.add_argument("--img", type=int, default=640, help="image size (square)")
+    p.add_argument("--batch", type=int, default=8, help="batch size")
+    p.add_argument("--epochs", type=int, default=50, help="epochs")
+    p.add_argument("--lr", type=float, default=1e-4, help="learning rate")
+    p.add_argument("--device", type=str, default="cuda", help="device: cuda or cpu")
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    args = get_args()
+    args = parse_args()
     train(args)
