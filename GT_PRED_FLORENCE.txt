@@ -1,55 +1,46 @@
+import argparse
+import os
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import glob
+import numpy as np
+
 from ultralytics import YOLO
-
-# ================================================
-# IMPORT OFFICIAL YOLOv8 LOSS FROM YOUR LOCAL COPY
-# ================================================
-# Make sure utils/loss.py with v8DetectionLoss is in same folder
-from utils.loss import v8DetectionLoss
+from utils.loss import v8DetectionLoss   # Your official utils/loss.py
 
 
-# =================================================
-# CUSTOM YOLO MODEL WITH MANUAL BACKBONE + NECK FWD
-# =================================================
+# ============================================================
+# Custom YOLO model with manual backbone → neck → detect
+# ============================================================
 
 class CustomYOLO(nn.Module):
-    def __init__(self, ckpt):
+    def __init__(self, ckpt_path):
         super().__init__()
-
-        # Load base YOLOv8 model
-        y = YOLO(ckpt)
+        y = YOLO(ckpt_path)
         self.model = y.model
         self.layers = self.model.model
         self.names = self.model.names
 
-        # Official GitHub YOLOv8 loss
         self.criterion = v8DetectionLoss(self.model)
 
     def forward(self, x, targets=None):
-        """
-        x: [B,3,h,w]
-        targets: dict with keys batch_idx, cls, bboxes (xywh normalized)
-        """
         layers = self.layers
 
-        # ========= BACKBONE =============
+        # --------------------- BACKBONE OUTPUTS ---------------------
         P3 = P4 = P5 = None
         for i, m in enumerate(layers):
             x = m(x)
             if i == 4: P3 = x
             if i == 6: P4 = x
-            if i == 9: 
+            if i == 9:
                 P5 = x
                 break
 
-        # =======================================
-        # OPTIONAL IR FUSION CAN MODIFY P3,P4,P5
-        # P3,P4,P5 = self.fusion(P3, P4, P5, ir_image)
-        # =======================================
+        # ---------- (OPTIONAL) Add IR fusion here -----------
 
-        # =============== NECK: 10 - 21 ==================
+        # ---------------------- NECK -------------------------
         P5_up = layers[10](P5)
         F4 = layers[11]([P5_up, P4])
         P4_out = layers[12](F4)
@@ -66,45 +57,65 @@ class CustomYOLO(nn.Module):
         F5b = layers[20]([P4_down, P5])
         P5b = layers[21](F5b)
 
-        # =============== DETECT HEAD =====================
+        # ---------------------- DETECT HEAD -------------------------
         detect = layers[22]
         preds = detect([P3_out, P4b, P5b])
 
         if targets is None:
-            return preds  # inference mode
+            return preds
 
-        # Loss mode
         total_loss, loss_items = self.criterion(preds, targets)
         return preds, total_loss, loss_items
 
 
-# ======================================
-# SIMPLE DATASET EXAMPLE (CUSTOMIZE THIS)
-# ======================================
+# ============================================================
+# Custom YOLO TXT Dataset Loader
+# ============================================================
 
-class DummyDataset(torch.utils.data.Dataset):
-    """
-    Replace with your dataset.
-    Must return:
-      image: tensor[3,H,W]
-      targets: dict(batch_idx, cls, bboxes)
-    """
-    def __init__(self):
+class YOLOTxtDataset(Dataset):
+    def __init__(self, images_dir, img_size=640):
         super().__init__()
+        self.img_size = img_size
+        self.image_paths = sorted(glob.glob(os.path.join(images_dir, "*.jpg")) +
+                                  glob.glob(os.path.join(images_dir, "*.png")))
 
-    def __len__(self): return 20
+        self.label_paths = [
+            p.replace("images", "labels").replace(".jpg", ".txt").replace(".png", ".txt")
+            for p in self.image_paths
+        ]
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def load_image(self, path):
+        img = Image.open(path).convert("RGB")
+        img = img.resize((self.img_size, self.img_size))
+        img = np.array(img).astype(np.float32) / 255.0
+        img = torch.from_numpy(img).permute(2, 0, 1)   # HWC → CHW
+        return img
+
+    def load_labels(self, label_path):
+        if not os.path.exists(label_path):
+            return torch.zeros((0, 5), dtype=torch.float32)
+
+        labels = []
+        with open(label_path, "r") as f:
+            for line in f.readlines():
+                cls, x, y, w, h = map(float, line.strip().split())
+                labels.append([cls, x, y, w, h])
+
+        return torch.tensor(labels, dtype=torch.float32)
 
     def __getitem__(self, idx):
-        img = torch.randn(3, 640, 640)
+        img = self.load_image(self.image_paths[idx])
+        labels = self.load_labels(self.label_paths[idx])
 
-        # Example: one box
-        targets = {
-            "batch_idx": torch.tensor([0], dtype=torch.long),
-            "cls":        torch.tensor([0], dtype=torch.long),
-            "bboxes":     torch.tensor([[0.5, 0.5, 0.3, 0.3]])  # xywh normalized
-        }
-        return img, targets
+        return img, labels, idx
 
+
+# ============================================================
+# Collate function for YOLO loss formatting
+# ============================================================
 
 def collate_fn(batch):
     imgs = []
@@ -112,14 +123,23 @@ def collate_fn(batch):
     cls = []
     bboxes = []
 
-    for b_i, (img, tgt) in enumerate(batch):
+    for b_i, (img, labels, idx) in enumerate(batch):
         imgs.append(img)
 
-        t_idx = tgt["batch_idx"] + b_i
-        batch_idx.append(t_idx)
+        if len(labels) > 0:
+            batch_idx.append(torch.full((len(labels),), b_i, dtype=torch.long))
+            cls.append(labels[:, 0].long())
+            bboxes.append(labels[:, 1:5])
+        else:
+            # no labels in this image
+            pass
 
-        cls.append(tgt["cls"])
-        bboxes.append(tgt["bboxes"])
+    if len(bboxes) == 0:
+        return torch.stack(imgs), {
+            "batch_idx": torch.zeros((0,), dtype=torch.long),
+            "cls": torch.zeros((0,), dtype=torch.long),
+            "bboxes": torch.zeros((0, 4), dtype=torch.float32)
+        }
 
     return (
         torch.stack(imgs),
@@ -131,25 +151,29 @@ def collate_fn(batch):
     )
 
 
-# =========================
-# MAIN TRAINING LOOP
-# =========================
-def train_custom():
+# ============================================================
+# Training Loop
+# ============================================================
+
+def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = CustomYOLO("yolov8n.pt").to(device)
+    model = CustomYOLO(args.weights).to(device)
 
-    dataset = DummyDataset()
-    loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
+    dataset = YOLOTxtDataset(args.train, img_size=args.img)
+    loader = DataLoader(dataset,
+                        batch_size=args.batch,
+                        shuffle=True,
+                        collate_fn=collate_fn)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    for epoch in range(10):
-        print(f"\n=== Epoch {epoch} ===")
+    for epoch in range(args.epochs):
+        print(f"\n=== Epoch {epoch+1}/{args.epochs} ===")
 
-        for imgs, targets in loader:
+        for imgs, t in loader:
             imgs = imgs.to(device)
-            targets = {k: v.to(device) for k, v in targets.items()}
+            targets = {k: v.to(device) for k, v in t.items()}
 
             preds, loss, loss_items = model(imgs, targets)
 
@@ -157,12 +181,31 @@ def train_custom():
             loss.backward()
             optimizer.step()
 
-            box_loss = loss_items[0].item()
-            cls_loss = loss_items[1].item()
-            dfl_loss = loss_items[2].item()
+            print(
+                f"loss:{loss.item():.4f}  "
+                f"box:{loss_items[0].item():.4f}  "
+                f"cls:{loss_items[1].item():.4f}  "
+                f"dfl:{loss_items[2].item():.4f}"
+            )
 
-            print(f"loss: {loss.item():.4f}   box:{box_loss:.4f}   cls:{cls_loss:.4f}   dfl:{dfl_loss:.4f}")
+
+# ============================================================
+# Argument Parser
+# ============================================================
+
+def get_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--train", type=str, required=True, help="path to train/images folder")
+    parser.add_argument("--weights", type=str, default="yolov8n.pt")
+    parser.add_argument("--img", type=int, default=640)
+    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-4)
+
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    train_custom()
+    args = get_args()
+    train(args)
