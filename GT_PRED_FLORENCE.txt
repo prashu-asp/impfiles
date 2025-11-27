@@ -1,133 +1,299 @@
+# train_custom_yolo.py
+# Ready-to-run minimal training script for the manual-YOLO pipeline you validated.
+# Expects folder structure:
+#   mydata/
+#     images/    (rgb images .jpg/.png)
+#     labels/    (matching .txt YOLO labels: class x y w h, normalized)
+#
+# Usage:
+#   python train_custom_yolo.py --data_dir ./mydata --model yolov8n.pt --epochs 3 --batch 4 --device cpu
+
+import os
+import argparse
+from pathlib import Path
+import math
+import time
+
 import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+
 from ultralytics import YOLO
 
-# Load YOLO
-y = YOLO("yolov8n.pt")
-model = y.model  # DetectionModel
-layers = model.model 
-
-from PIL import Image
-import torchvision.transforms as T
-import numpy as np
-
-# ---------------------------------------------------------
-# Load a real image (BGR/RGB)
-# ---------------------------------------------------------
-
-def pil_to_tensor(pil_img, size=(640, 640)):
+# ----------------------------
+# Utils: PIL -> tensor (no numpy)
+# ----------------------------
+def pil_to_tensor_uint8(pil_img, size=(640, 640)):
     pil_img = pil_img.resize(size)
-    img_list = list(pil_img.getdata())  # pure Python list
-    img_tensor = torch.tensor(img_list, dtype=torch.uint8)
-    img_tensor = img_tensor.view(size[1], size[0], 3)  # H,W,C
-    img_tensor = img_tensor.permute(2,0,1).float() / 255.0  # C,H,W
-    return img_tensor.unsqueeze(0)  # [1,3,640,640]
+    pixels = list(pil_img.getdata())  # list of (R,G,B)
+    t = torch.tensor(pixels, dtype=torch.uint8)
+    t = t.view(size[1], size[0], 3)  # H, W, C
+    t = t.permute(2, 0, 1).float() / 255.0  # C, H, W normalized
+    return t
 
-# ---------------------------------------------------------
-# Load image
-# ---------------------------------------------------------
-img_path = "F://images_gemini//images_gemini//juice//RGB//black_bright_orange_316663703505.png"   # CHANGE THIS
-img = Image.open(img_path).convert("RGB")
-x = pil_to_tensor(img)
-# x = torch.randn(1, 3, 640, 640)
+# ----------------------------
+# Dataset: images/ + labels/
+# ----------------------------
+class YOLOTXTData(Dataset):
+    def __init__(self, img_dir, labels_dir, imgsz=640):
+        self.img_paths = sorted([p for p in Path(img_dir).iterdir() if p.suffix.lower() in [".jpg", ".png", ".jpeg"]])
+        self.labels_dir = Path(labels_dir)
+        self.imgsz = imgsz
 
-# ---------------------------------------------------------
-# Get YOLO normal prediction (for comparison)
-# ---------------------------------------------------------
-preds_normal = model(x)[0]   # YOLO forward
+    def __len__(self):
+        return len(self.img_paths)
 
-print("Normal YOLO prediction shape:", preds_normal.shape)
+    def _read_label(self, label_path):
+        boxes = []
+        if not label_path.exists():
+            return torch.zeros((0,6), dtype=torch.float32)  # no labels
+        for ln in label_path.read_text().strip().splitlines():
+            if not ln:
+                continue
+            vals = ln.split()
+            if len(vals) < 5:
+                continue
+            cls = float(vals[0])
+            x = float(vals[1])
+            y = float(vals[2])
+            w = float(vals[3])
+            h = float(vals[4])
+            # we'll set batch index later in collate
+            boxes.append([cls, x, y, w, h])
+        if len(boxes) == 0:
+            return torch.zeros((0,5), dtype=torch.float32)
+        return torch.tensor(boxes, dtype=torch.float32)
 
-# ---------------------------------------------------------
-# 1. Extract P3, P4, P5 using hooks
-# ---------------------------------------------------------
-P3_layer = 4
-P4_layer = 6
-P5_layer = 9
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        label_path = self.labels_dir / (img_path.stem + ".txt")
+        img = Image.open(img_path).convert("RGB")
+        t = pil_to_tensor_uint8(img, size=(self.imgsz, self.imgsz))  # [3,H,W] float32 0..1
+        labels = self._read_label(label_path)  # (N,5) [cls,x,y,w,h]
+        return t, labels, str(img_path)
 
-P3 = None
-P4 = None
-P5 = None
+# ----------------------------
+# Collate: stack imgs, concat targets with batch_idx
+# ----------------------------
+def collate_fn(batch):
+    # batch: list of (img_tensor, labels_tensor, img_path)
+    imgs = [b[0] for b in batch]
+    labels = [b[1] for b in batch]
+    paths = [b[2] for b in batch]
+    imgs_t = torch.stack(imgs)  # B,3,H,W
 
-def hook_p3(m, inp, out):
-    global P3
-    P3 = out
+    # build targets in format: [batch_idx, cls, x, y, w, h]
+    tlist = []
+    for i, lab in enumerate(labels):
+        if lab.numel() == 0:
+            continue
+        # lab shape (N,5): cls,x,y,w,h
+        bi = torch.full((lab.shape[0], 1), float(i))
+        new = torch.cat([bi, lab], dim=1)  # (N,6)
+        tlist.append(new)
+    if len(tlist) > 0:
+        targets = torch.cat(tlist, dim=0)
+    else:
+        targets = torch.zeros((0,6), dtype=torch.float32)
+    return imgs_t, targets, paths
 
-def hook_p4(m, inp, out):
-    global P4
-    P4 = out
+# ----------------------------
+# Custom model wrapper (manual-forward) - uses the same layer indices you validated
+# ----------------------------
+class CustomYOLO(nn.Module):
+    def __init__(self, ckpt_path):
+        super().__init__()
+        # load ultralytics model object and extract its internal sequential modules
+        y = YOLO(ckpt_path)
+        self.base = y  # keep YOLO object for names etc.
+        self.model = y.model  # DetectionModel
+        self.layers = self.model.model  # Sequential list
+        self.names = self.model.names
 
-def hook_p5(m, inp, out):
-    global P5
-    P5 = out
+        # try to obtain official loss object (different versions store it differently)
+        self.criterion = None
+        # Try several common locations
+        for attr in ("criterion", "loss", "loss_fn", "criterion_loss"):
+            if hasattr(self.model, attr):
+                self.criterion = getattr(self.model, attr)
+                print(f"[info] using loss from model.{attr}")
+                break
+        if self.criterion is None and hasattr(self.base, "criterion"):
+            self.criterion = getattr(self.base, "criterion")
+            print("[info] using loss from base.criterion")
+        if self.criterion is None:
+            # fallback: try model.model[-1] detect module .loss if exists
+            try:
+                detect_mod = self.layers[-1]
+                if hasattr(detect_mod, "loss"):
+                    self.criterion = detect_mod.loss
+                    print("[info] using detect.loss as criterion")
+            except Exception:
+                pass
 
-hooks = []
-hooks.append(layers[P3_layer].register_forward_hook(hook_p3))
-hooks.append(layers[P4_layer].register_forward_hook(hook_p4))
-hooks.append(layers[P5_layer].register_forward_hook(hook_p5))
+        if self.criterion is None:
+            print("[warning] Could not find Ultralytics loss object automatically. You may need to adapt this script for your Ultralytics version.")
 
-# Run backbone forward
-_ = model(x)
+    def forward(self, imgs, targets=None):
+        """
+        imgs: (B,3,H,W)
+        targets: tensor (M,6) or empty tensor, columns [batch_idx, cls, x, y, w, h] normalized
+        returns: preds_raw, loss (if targets passed and criterion available)
+        """
+        layers = self.layers
+        x = imgs
 
-for h in hooks:
-    h.remove()
+        # ---- backbone pass (layers 0..9) capturing P3,P4,P5 at indices [4,6,9] as validated ----
+        P3 = P4 = P5 = None
+        for i, m in enumerate(layers):
+            # only run until backbone complete (stop after layer 9)
+            if i > 9:
+                break
+            x = m(x)
+            if i == 4:
+                P3 = x
+            if i == 6:
+                P4 = x
+            if i == 9:
+                P5 = x
 
-print("Extracted:")
-print("P3:", P3.shape)
-print("P4:", P4.shape)
-print("P5:", P5.shape)
+        # sanity checks
+        assert P3 is not None and P4 is not None and P5 is not None, "Backbone outputs missing"
 
-# ---------------------------------------------------------
-# 2. Replicate neck manually (layers 10 → 21)
-# ---------------------------------------------------------
+        # ---- (PLACE TO INSERT MODIFICATIONS) ----
+        # e.g. P3 = P3 * 1.0  # identity
+        # You can insert IR fusion or FiLM here. Keep shapes unchanged.
+        # -----------------------------------------
 
-upsample1 = layers[10]
-concat1   = layers[11]
-c2f1      = layers[12]
-upsample2 = layers[13]
-concat2   = layers[14]
-c2f2      = layers[15]
-down1     = layers[16]
-concat3   = layers[17]
-c2f3      = layers[18]
-down2     = layers[19]
-concat4   = layers[20]
-c2f4      = layers[21]
-detect    = layers[22]
+        # ---- replicate neck exactly (layers 10..21) ----
+        # fetch neck modules
+        upsample1 = layers[10]
+        concat1   = layers[11]
+        c2f1      = layers[12]
+        upsample2 = layers[13]
+        concat2   = layers[14]
+        c2f2      = layers[15]
+        down1     = layers[16]
+        concat3   = layers[17]
+        c2f3      = layers[18]
+        down2     = layers[19]
+        concat4   = layers[20]
+        c2f4      = layers[21]
+        detect    = layers[22]
 
-# ----- FPN path -----
-P5_up = upsample1(P5)
-F4 = concat1([P5_up, P4])
-P4_out = c2f1(F4)
+        # FPN
+        P5_up = upsample1(P5)
+        F4 = concat1([P5_up, P4])
+        P4_out = c2f1(F4)
 
-P4_up = upsample2(P4_out)
-F3 = concat2([P4_up, P3])
-P3_out = c2f2(F3)
+        P4_up = upsample2(P4_out)
+        F3 = concat2([P4_up, P3])
+        P3_out = c2f2(F3)
 
-# ----- PAN path -----
-P3_down = down1(P3_out)
-F4b = concat3([P3_down, P4_out])
-P4b = c2f3(F4b)
+        # PAN
+        P3_down = down1(P3_out)
+        F4b = concat3([P3_down, P4_out])
+        P4b = c2f3(F4b)
 
-P4_down = down2(P4b)
-F5 = concat4([P4_down, P5])
-P5b = c2f4(F5)
+        P4_down = down2(P4b)
+        F5 = concat4([P4_down, P5])
+        P5b = c2f4(F5)
 
-# Final features (like YOLO neck output)
-neck_out = [P3_out, P4b, P5b]
+        neck_out = [P3_out, P4b, P5b]
 
-# ---------------------------------------------------------
-# 3. Detect head
-# ---------------------------------------------------------
-preds_manual = detect(neck_out)[0]
+        # Detect: note detect(...) often returns tuple (preds, something). We handle it defensively.
+        preds_raw = detect(neck_out)
+        # many Detect implementations return (pred_tensor,) or tuple(pred_tensor, extra)
+        if isinstance(preds_raw, tuple) or isinstance(preds_raw, list):
+            preds = preds_raw[0]
+        else:
+            preds = preds_raw
 
-print("Manual prediction shape:", preds_manual.shape)
+        # if targets provided and we have a criterion, compute loss
+        loss = None
+        if targets is not None and (self.criterion is not None):
+            try:
+                # many Ultralytics criterion accept (preds, targets) directly
+                loss_out = self.criterion(preds, targets)
+                # criterion might return dict or scalar
+                if isinstance(loss_out, dict):
+                    # pick the main loss (sum)
+                    loss = sum([v for v in loss_out.values()])
+                else:
+                    loss = loss_out
+            except Exception as e:
+                print("[warning] criterion call failed:", e)
+                # some versions expect (preds, batch) where batch is dict; fallback not implemented
+                loss = None
 
-# ---------------------------------------------------------
-# 4. Compare
-# ---------------------------------------------------------
-print("\nComparison:")
-print("Normal:", preds_normal.shape,preds_normal)
-print("Manual:", preds_manual.shape,preds_manual)
+        return preds, loss
 
-# Shapes should match exactly
+# ----------------------------
+# Training loop
+# ----------------------------
+def train(args):
+    device = args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
+    print(f"[info] device = {device}")
 
+    # dataset
+    img_dir = os.path.join(args.data_dir, "images")
+    labels_dir = os.path.join(args.data_dir, "labels")
+    ds = YOLOTXTData(img_dir, labels_dir, imgsz=args.imgsz)
+    dl = DataLoader(ds, batch_size=args.batch, shuffle=True, collate_fn=collate_fn, num_workers=0)
+
+    # model
+    custom = CustomYOLO(args.model).to(device)
+
+    # optimizer: train all parameters (you can freeze backbone layers if desired)
+    optim = torch.optim.Adam(custom.parameters(), lr=args.lr)
+
+    # training
+    custom.train()
+    for epoch in range(args.epochs):
+        t0 = time.time()
+        running_loss = 0.0
+        n_batches = 0
+        for imgs, targets, paths in dl:
+            imgs = imgs.to(device)
+            # targets is (M,6)
+            targets = targets.to(device)
+
+            optim.zero_grad()
+            preds, loss = custom(imgs, targets)
+            if loss is None:
+                # cannot compute loss automatically — give guidance and exit
+                print("[error] loss is None. Your Ultralytics version's loss API may be incompatible with this script.")
+                print("  Inspect `custom.criterion` and adapt the script to call loss correctly.")
+                return
+
+            loss.backward()
+            optim.step()
+
+            running_loss += float(loss.item())
+            n_batches += 1
+
+        avg_loss = running_loss / max(1, n_batches)
+        print(f"Epoch {epoch+1}/{args.epochs}  avg_loss={avg_loss:.4f}  time={(time.time()-t0):.1f}s")
+
+    # Save checkpoint
+    out_path = "custom_yolo_trained.pt"
+    torch.save(custom.state_dict(), out_path)
+    print(f"[info] saved checkpoint to {out_path}")
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", required=True, help="path to dataset folder with images/ and labels/")
+    parser.add_argument("--model", default="yolov8n.pt", help="path to yolov8 .pt")
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--device", type=str, default="cpu")
+    args = parser.parse_args()
+
+    train(args)
