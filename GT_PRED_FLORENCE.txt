@@ -1,6 +1,9 @@
-# train_custom_yolotxt_v8loss.py
+# train_custom_yolo_film.py
+# Requirements: ultralytics package + your utils/loss.py (v8DetectionLoss) placed as utils/loss.py
+# Usage example:
+# python train_custom_yolo_film.py --rgb_dir dataset/images --ir_dir dataset/ir --labels_dir dataset/labels --weights yolov8n.pt --img 640 --batch 8 --epochs 20 --device cuda
+
 import argparse
-import os
 import time
 from pathlib import Path
 
@@ -10,51 +13,61 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 
 from ultralytics import YOLO
-
-# Import the official v8DetectionLoss you placed in utils/loss.py
-# (adapt import if you placed file elsewhere)
-from utils.loss import v8DetectionLoss
-
+from utils.loss import v8DetectionLoss   # your local copy
 
 # ---------------------------
-# Utility: PIL -> tensor without numpy
+# utils: PIL -> tensor WITHOUT numpy
 # ---------------------------
-def pil_to_tensor_uint8(pil_img, size=(640, 640)):
-    """
-    Convert PIL image -> torch tensor [3,H,W], values in [0,1], WITHOUT numpy.
-    """
+def pil_to_tensor_uint8(pil_img: Image.Image, size=(640, 640)) -> torch.Tensor:
     pil_img = pil_img.resize(size)
-    pixels = list(pil_img.getdata())  # list of (R,G,B)
-    t = torch.tensor(pixels, dtype=torch.uint8)  # (H*W, 3)
-    t = t.view(size[1], size[0], 3)  # H, W, C
-    t = t.permute(2, 0, 1).float() / 255.0  # C,H,W float
+    pixels = list(pil_img.getdata())  # (H*W, 3)
+    t = torch.tensor(pixels, dtype=torch.float32).view(size[1], size[0], 3)  # H,W,C
+    t = t.permute(2, 0, 1) / 255.0  # C,H,W normalized float
     return t
 
 
 # ---------------------------
-# Dataset: YOLO TXT format
+# Dataset: returns rgb, ir, labels
 # ---------------------------
-class YOLOTxtDataset(Dataset):
-    """
-    images_dir: folder containing image files (.jpg/.png)
-    labels_dir: folder containing matching .txt files (same stem). Each line: cls x y w h (normalized 0..1)
-    """
-    def __init__(self, images_dir: str, labels_dir: str, imgsz: int = 640, exts=(".jpg", ".png", ".jpeg")):
-        super().__init__()
-        self.imgsz = imgsz
-        images_dir = Path(images_dir)
-        self.image_paths = sorted([p for p in images_dir.iterdir() if p.suffix.lower() in exts])
+class RGBIR_YOLOTxtDataset(Dataset):
+    def __init__(self, rgb_dir, ir_dir, labels_dir, imgsz=640, exts=(".jpg", ".png", ".jpeg")):
+        self.rgb_dir = Path(rgb_dir)
+        self.ir_dir = Path(ir_dir)
         self.labels_dir = Path(labels_dir)
+        self.imgsz = imgsz
+
+        self.rgb_images = sorted([p for p in self.rgb_dir.iterdir() if p.suffix.lower() in exts])
+        if len(self.rgb_images) == 0:
+            raise RuntimeError(f"No RGB images found in {rgb_dir}")
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.rgb_images)
 
-    def load_image(self, p: Path):
+    def load_rgb(self, p: Path):
         img = Image.open(p).convert("RGB")
         return pil_to_tensor_uint8(img, size=(self.imgsz, self.imgsz))
 
-    def load_labels(self, img_path: Path):
-        lbl_path = self.labels_dir / (img_path.stem + ".txt")
+    def load_ir(self, p: Path):
+        # assumes IR filename equals RGB filename but in ir_dir
+        ir_path = self.ir_dir / p.name
+        if not ir_path.exists():
+            # fallback: try same stem + "_ir"
+            alt = self.ir_dir / (p.stem + "_ir" + p.suffix)
+            if alt.exists():
+                ir_path = alt
+            else:
+                # no IR — return zeros
+                return torch.zeros((1, self.imgsz, self.imgsz), dtype=torch.float32)
+        ir = Image.open(ir_path).convert("L")  # single channel
+        # convert to 1xHxW tensor normalized
+        ir = ir.resize((self.imgsz, self.imgsz))
+        pixels = list(ir.getdata())
+        t = torch.tensor(pixels, dtype=torch.float32).view(self.imgsz, self.imgsz) / 255.0
+        t = t.unsqueeze(0)  # 1,H,W
+        return t
+
+    def load_labels(self, p: Path):
+        lbl_path = self.labels_dir / (p.stem + ".txt")
         if not lbl_path.exists():
             return torch.zeros((0, 5), dtype=torch.float32)
         rows = []
@@ -77,86 +90,188 @@ class YOLOTxtDataset(Dataset):
         return torch.tensor(rows, dtype=torch.float32)
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        img = self.load_image(img_path)
-        labels = self.load_labels(img_path)
-        return img, labels, str(img_path)
+        rgb_path = self.rgb_images[idx]
+        rgb = self.load_rgb(rgb_path)
+        ir = self.load_ir(rgb_path)
+        labels = self.load_labels(rgb_path)
+        return rgb, ir, labels, str(rgb_path)
 
 
 # ---------------------------
-# Collate to produce targets as v8DetectionLoss expects
-# returns imgs_tensor, targets_dict
-# targets_dict contains:
-#   "batch_idx": (N,) long
-#   "cls": (N,) long
-#   "bboxes": (N,4) float (xywh normalized)
+# collate_fn builds YOLO loss targets and batches IRs too
 # ---------------------------
 def collate_fn(batch):
+    # batch: list of (rgb, ir, labels, path)
     imgs = []
+    irs = []
     batch_idx_list = []
     cls_list = []
     bboxes_list = []
 
-    for bi, (img, labels, path) in enumerate(batch):
-        imgs.append(img)
+    for bi, (rgb, ir, labels, path) in enumerate(batch):
+        imgs.append(rgb)
+        irs.append(ir)
         if labels.numel() == 0:
             continue
-        # labels shape (n,5): cls, x, y, w, h
         n = labels.shape[0]
         batch_idx_list.append(torch.full((n,), bi, dtype=torch.long))
         cls_list.append(labels[:, 0].long())
         bboxes_list.append(labels[:, 1:5].float())
 
-    imgs_t = torch.stack(imgs)  # B,3,H,W
+    imgs_t = torch.stack(imgs)   # B,3,H,W
+    irs_t = torch.stack(irs)     # B,1,H,W  (or zeros if missing)
 
     if len(bboxes_list) == 0:
-        return imgs_t, {
+        targets = {
             "batch_idx": torch.zeros((0,), dtype=torch.long),
             "cls": torch.zeros((0,), dtype=torch.long),
             "bboxes": torch.zeros((0, 4), dtype=torch.float32),
         }
+    else:
+        targets = {
+            "batch_idx": torch.cat(batch_idx_list),
+            "cls": torch.cat(cls_list),
+            "bboxes": torch.cat(bboxes_list),
+        }
 
-    targets = {
-        "batch_idx": torch.cat(batch_idx_list),
-        "cls": torch.cat(cls_list),
-        "bboxes": torch.cat(bboxes_list),
-    }
-    return imgs_t, targets
+    return imgs_t, irs_t, targets
 
 
 # ---------------------------
-# Custom model wrapper: manual backbone -> neck -> detect
-# returns preds only (loss computed in training loop to handle return format)
+# FiLM fusion module
+# - IR encoder -> global pool -> per-scale MLP heads -> produce gamma & beta for channels
 # ---------------------------
-class CustomYOLO(nn.Module):
-    def __init__(self, weights_path: str):
+class FiLM_Fuser(nn.Module):
+    def __init__(self, in_ch=1, p3_ch=128, p4_ch=256, p5_ch=512, hidden=64):
+        super().__init__()
+        # small conv encoder for IR (shared)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_ch, 16, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(),
+        )
+        # global pooling -> MLP
+        self.pool = nn.AdaptiveAvgPool2d(1)  # produce (B,64,1,1)
+        # MLP heads for each scale
+        self.p3_mlp = nn.Sequential(
+            nn.Linear(64, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, p3_ch * 2),  # gamma + beta
+        )
+        self.p4_mlp = nn.Sequential(
+            nn.Linear(64, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, p4_ch * 2),
+        )
+        self.p5_mlp = nn.Sequential(
+            nn.Linear(64, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, p5_ch * 2),
+        )
+
+        # init gamma around 1, beta around 0
+        for m in [self.p3_mlp, self.p4_mlp, self.p5_mlp]:
+            nn.init.zeros_(m[-1].bias)
+            nn.init.normal_(m[-1].weight, mean=0.0, std=0.02)
+
+    def forward(self, ir):
+        """
+        ir: [B,1,H,W]
+        returns: tuple of (gamma3,beta3), (gamma4,beta4), (gamma5,beta5)
+        each gamma/beta shapes: [B, C] (to be unsqueezed to [B,C,1,1])
+        """
+        x = self.encoder(ir)             # B,64,H',W'
+        x = self.pool(x).view(x.shape[0], -1)  # B, 64
+        p3 = self.p3_mlp(x)              # B, 2*C3
+        p4 = self.p4_mlp(x)
+        p5 = self.p5_mlp(x)
+
+        def split_gamma_beta(t):
+            B, v = t.shape
+            C = v // 2
+            gamma = t[:, :C]
+            beta = t[:, C:]
+            # initialize gamma around 1:
+            gamma = 1.0 + 0.1 * torch.tanh(gamma)
+            beta = 0.1 * torch.tanh(beta)
+            return gamma, beta
+
+        g3, b3 = split_gamma_beta(p3)
+        g4, b4 = split_gamma_beta(p4)
+        g5, b5 = split_gamma_beta(p5)
+        return (g3, b3), (g4, b4), (g5, b5)
+
+
+# ---------------------------
+# Custom YOLO wrapper: manual-forward as before but apply FiLM fusion
+# ---------------------------
+class CustomYOLOWithFiLM(nn.Module):
+    def __init__(self, weights_path, film_hidden=64):
         super().__init__()
         y = YOLO(weights_path)
-        self.model = y.model  # DetectionModel
-        self.layers = self.model.model
+        self.base = y
+        self.model = y.model         # DetectionModel
+        self.layers = self.model.model  # Sequential modules
         self.names = self.model.names
 
-        # Official v8DetectionLoss expects the model object
-        self.criterion = v8DetectionLoss(self.model)
+        # FiLM fuser (in-ch=1 for IR)
+        # Channels for P3, P4, P5 are typical for yolov8n/s: 128,256,512 (we use these by default)
+        self.fuser = FiLM_Fuser(in_ch=1, p3_ch=128, p4_ch=256, p5_ch=512, hidden=film_hidden)
 
-    def forward(self, x):
+        # criterion created later after moving model to device
+        self.criterion = None
+
+    def build_loss(self, device):
+        # create loss AFTER moving model to device (so internal tensors are on correct device)
+        self.criterion = v8DetectionLoss(self.model)
+        # ensure internal buffers are on the right device (defensive)
+        try:
+            self.criterion.proj = self.criterion.proj.to(device)
+        except Exception:
+            pass
+        try:
+            self.criterion.bbox_loss = self.criterion.bbox_loss.to(device)
+        except Exception:
+            pass
+
+    def forward(self, rgb, ir):
+        """
+        rgb: [B,3,H,W], ir: [B,1,H,W]
+        returns preds (whatever Detect returns)
+        """
         layers = self.layers
-        # backbone 0..9
+        x = rgb
+
+        # ------------------- backbone (0..9) producing P3,P4,P5 -------------------
         P3 = P4 = P5 = None
-        xi = x
         for i, m in enumerate(layers):
-            xi = m(xi)
+            x = m(x)
             if i == 4:
-                P3 = xi
+                P3 = x
             if i == 6:
-                P4 = xi
+                P4 = x
             if i == 9:
-                P5 = xi
+                P5 = x
                 break
 
-        # optional fusion point here if needed later
+        # ------------------- FiLM fusion using IR -------------------
+        # get gammas and betas
+        (g3, b3), (g4, b4), (g5, b5) = self.fuser(ir)
+        # unsqueeze to match spatial dims
+        def apply_film(P, g, b):
+            # P: [B, C, H, W], g/b: [B, C]
+            g = g.view(g.shape[0], g.shape[1], 1, 1).to(P.dtype).to(P.device)
+            b = b.view(b.shape[0], b.shape[1], 1, 1).to(P.dtype).to(P.device)
+            return g * P + b
 
-        # neck 10..21 manual replication
+        P3 = apply_film(P3, g3, b3)
+        P4 = apply_film(P4, g4, b4)
+        P5 = apply_film(P5, g5, b5)
+
+        # ------------------- neck (10..21) replication (as validated earlier) -------------------
         P5_up = layers[10](P5)
         F4 = layers[11]([P5_up, P4])
         P4_out = layers[12](F4)
@@ -173,48 +288,53 @@ class CustomYOLO(nn.Module):
         F5b = layers[20]([P4_down, P5])
         P5b = layers[21](F5b)
 
+        # detect head
         detect = layers[22]
         preds = detect([P3_out, P4b, P5b])
-
         return preds
 
 
 # ---------------------------
-# Training loop
+# TRAINING LOOP (device-safe)
 # ---------------------------
 def train(args):
     device = args.device if torch.cuda.is_available() and "cuda" in args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[info] device = {device}")
 
-    # dataset and dataloader
-    ds = YOLOTxtDataset(args.train_dir, labels_dir=args.labels_dir, imgsz=args.img)
+    # dataset + loader
+    ds = RGBIR_YOLOTxtDataset(args.rgb_dir, args.ir_dir, args.labels_dir, imgsz=args.img)
     dl = DataLoader(ds, batch_size=args.batch, shuffle=True, collate_fn=collate_fn, num_workers=0)
 
     # model
-    model = CustomYOLO(args.weights).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    model = CustomYOLOWithFiLM(args.weights, film_hidden=args.film_hidden)
+    model = model.to(device)
 
-    start_time = time.time()
+    # now build loss on correct device
+    model.build_loss(device)
+
+    optimizer = torch.optim.Adam(list(model.parameters()), lr=args.lr)
+
     model.train()
+    start_time = time.time()
 
     for epoch in range(1, args.epochs + 1):
+        print(f"\n=== Epoch {epoch}/{args.epochs} ===")
         epoch_loss = 0.0
         n_batches = 0
         t0 = time.time()
-        print(f"\n--- Epoch {epoch}/{args.epochs} ---")
 
-        for imgs, targets in dl:
+        for imgs, irs, targets in dl:
             imgs = imgs.to(device)
-            # build device targets dict
+            irs = irs.to(device)
+            # move target tensors to device
             tgt = {k: v.to(device) for k, v in targets.items()}
 
-            preds = model(imgs)
+            preds = model(imgs, irs)
 
-            # v8DetectionLoss returns: (loss_vector * batch_size, loss.detach())
+            # v8DetectionLoss returns (loss_vec_scaled, loss_items)
             loss_vec_scaled, loss_items = model.criterion(preds, tgt)
 
-            # Convert to scalar for backward:
-            # loss_vec_scaled is a tensor with 3 elements (box,cls,dfl) scaled by batch_size
+            # convert to scalar for backward (loss_vec_scaled is tensor of 3 elements scaled by batch_size)
             loss_scalar = loss_vec_scaled.sum()
 
             optimizer.zero_grad()
@@ -224,37 +344,36 @@ def train(args):
             epoch_loss += float(loss_scalar.item())
             n_batches += 1
 
-            box_loss = float(loss_items[0].item())
-            cls_loss = float(loss_items[1].item())
-            dfl_loss = float(loss_items[2].item())
+            # loss_items is detached tensor of 3 per-component losses
+            box, cls, dfl = loss_items.tolist()
+            print(f"batch {n_batches} | total:{loss_scalar.item():.4f} box:{box:.4f} cls:{cls:.4f} dfl:{dfl:.4f}")
 
-            print(f"batch {n_batches}  loss:{loss_scalar.item():.4f}  box:{box_loss:.4f}  cls:{cls_loss:.4f}  dfl:{dfl_loss:.4f}")
+        avg = epoch_loss / max(1, n_batches)
+        print(f"Epoch {epoch} done in {(time.time()-t0):.1f}s avg_loss={avg:.4f}")
 
-        avg_loss = epoch_loss / max(1, n_batches)
-        print(f"Epoch {epoch} done in {(time.time() - t0):.1f}s  avg_loss={avg_loss:.4f}")
+        # save checkpoint
+        ckpt = f"custom_film_epoch{epoch}.pt"
+        torch.save(model.state_dict(), ckpt)
+        print(f"[info] saved {ckpt}")
 
-        # save checkpoint each epoch
-        ckpt_path = f"custom_yolo_epoch{epoch}.pt"
-        torch.save(model.state_dict(), ckpt_path)
-        print(f"[info] saved checkpoint {ckpt_path}")
-
-    total_time = time.time() - start_time
-    print(f"Training finished in {total_time/60:.2f} minutes")
+    print(f"Training finished in {(time.time()-start_time)/60:.2f} minutes")
 
 
 # ---------------------------
-# Argument parser
+# CLI
 # ---------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--train_dir", required=True, help="path to images folder for training")
-    p.add_argument("--labels_dir", required=True, help="path to labels folder (txt files)")
-    p.add_argument("--weights", default="yolov8n.pt", help="path to yolov8 weights .pt")
-    p.add_argument("--img", type=int, default=640, help="image size (square)")
-    p.add_argument("--batch", type=int, default=8, help="batch size")
-    p.add_argument("--epochs", type=int, default=50, help="epochs")
-    p.add_argument("--lr", type=float, default=1e-4, help="learning rate")
-    p.add_argument("--device", type=str, default="cuda", help="device: cuda or cpu")
+    p.add_argument("--rgb_dir", required=True, help="path to RGB images folder")
+    p.add_argument("--ir_dir", required=True, help="path to IR images folder (same filenames expected)")
+    p.add_argument("--labels_dir", required=True, help="path to YOLO txt labels folder")
+    p.add_argument("--weights", default="yolov8n.pt", help="yolov8 weights .pt")
+    p.add_argument("--img", type=int, default=640)
+    p.add_argument("--batch", type=int, default=8)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--film_hidden", type=int, default=64, help="hidden dim for FiLM MLP")
     return p.parse_args()
 
 
