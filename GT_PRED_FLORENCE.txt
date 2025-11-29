@@ -1,382 +1,87 @@
-# train_custom_yolo_film.py
-# Requirements: ultralytics package + your utils/loss.py (v8DetectionLoss) placed as utils/loss.py
-# Usage example:
-# python train_custom_yolo_film.py --rgb_dir dataset/images --ir_dir dataset/ir --labels_dir dataset/labels --weights yolov8n.pt --img 640 --batch 8 --epochs 20 --device cuda
+from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 
-import argparse
-import time
-from pathlib import Path
+# vLLM server endpoint
+client = OpenAI(
+    base_url="http://0.0.0.0:8002/v1",
+    api_key="not-needed"
+)
 
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
-
-from ultralytics import YOLO
-from utils.loss import v8DetectionLoss   # your local copy
-
-# ---------------------------
-# utils: PIL -> tensor WITHOUT numpy
-# ---------------------------
-def pil_to_tensor_uint8(pil_img: Image.Image, size=(640, 640)) -> torch.Tensor:
-    pil_img = pil_img.resize(size)
-    pixels = list(pil_img.getdata())  # (H*W, 3)
-    t = torch.tensor(pixels, dtype=torch.float32).view(size[1], size[0], 3)  # H,W,C
-    t = t.permute(2, 0, 1) / 255.0  # C,H,W normalized float
-    return t
+MODEL_ID = "deepseek"
 
 
-# ---------------------------
-# Dataset: returns rgb, ir, labels
-# ---------------------------
-class RGBIR_YOLOTxtDataset(Dataset):
-    def __init__(self, rgb_dir, ir_dir, labels_dir, imgsz=640, exts=(".jpg", ".png", ".jpeg")):
-        self.rgb_dir = Path(rgb_dir)
-        self.ir_dir = Path(ir_dir)
-        self.labels_dir = Path(labels_dir)
-        self.imgsz = imgsz
+# ---------------- Helper: one chat call ----------------
+def generate_chat(query: str, trace: str, temperature=0.2):
 
-        self.rgb_images = sorted([p for p in self.rgb_dir.iterdir() if p.suffix.lower() in exts])
-        if len(self.rgb_images) == 0:
-            raise RuntimeError(f"No RGB images found in {rgb_dir}")
+    payload = {
+        "model": MODEL_ID,
+        "messages": [
+            {
+                "role": "user",
+                "content": f"{query} and {trace}"
+            }
+        ],
+        "temperature": temperature,
+        "top_p": 0.95,
+        "seed": 42,
+        "max_tokens": 256
+    }
 
-    def __len__(self):
-        return len(self.rgb_images)
-
-    def load_rgb(self, p: Path):
-        img = Image.open(p).convert("RGB")
-        return pil_to_tensor_uint8(img, size=(self.imgsz, self.imgsz))
-
-    def load_ir(self, p: Path):
-        # assumes IR filename equals RGB filename but in ir_dir
-        ir_path = self.ir_dir / p.name
-        if not ir_path.exists():
-            # fallback: try same stem + "_ir"
-            alt = self.ir_dir / (p.stem + "_ir" + p.suffix)
-            if alt.exists():
-                ir_path = alt
-            else:
-                # no IR — return zeros
-                return torch.zeros((1, self.imgsz, self.imgsz), dtype=torch.float32)
-        ir = Image.open(ir_path).convert("L")  # single channel
-        # convert to 1xHxW tensor normalized
-        ir = ir.resize((self.imgsz, self.imgsz))
-        pixels = list(ir.getdata())
-        t = torch.tensor(pixels, dtype=torch.float32).view(self.imgsz, self.imgsz) / 255.0
-        t = t.unsqueeze(0)  # 1,H,W
-        return t
-
-    def load_labels(self, p: Path):
-        lbl_path = self.labels_dir / (p.stem + ".txt")
-        if not lbl_path.exists():
-            return torch.zeros((0, 5), dtype=torch.float32)
-        rows = []
-        with open(lbl_path, "r") as f:
-            for ln in f:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                parts = ln.split()
-                if len(parts) < 5:
-                    continue
-                cls = float(parts[0])
-                x = float(parts[1])
-                y = float(parts[2])
-                w = float(parts[3])
-                h = float(parts[4])
-                rows.append([cls, x, y, w, h])
-        if len(rows) == 0:
-            return torch.zeros((0, 5), dtype=torch.float32)
-        return torch.tensor(rows, dtype=torch.float32)
-
-    def __getitem__(self, idx):
-        rgb_path = self.rgb_images[idx]
-        rgb = self.load_rgb(rgb_path)
-        ir = self.load_ir(rgb_path)
-        labels = self.load_labels(rgb_path)
-        return rgb, ir, labels, str(rgb_path)
+    try:
+        response = client.chat.completions.create(**payload)
+        return response.choices[0].message["content"]
+    except Exception as e:
+        return f"ERROR: {str(e)}"
 
 
-# ---------------------------
-# collate_fn builds YOLO loss targets and batches IRs too
-# ---------------------------
-def collate_fn(batch):
-    # batch: list of (rgb, ir, labels, path)
-    imgs = []
-    irs = []
-    batch_idx_list = []
-    cls_list = []
-    bboxes_list = []
+# ---------------- Process Dataset ----------------
+def process_dataset(dataset: dict, max_concurrency: int = 43):
+    all_results = {}
 
-    for bi, (rgb, ir, labels, path) in enumerate(batch):
-        imgs.append(rgb)
-        irs.append(ir)
-        if labels.numel() == 0:
-            continue
-        n = labels.shape[0]
-        batch_idx_list.append(torch.full((n,), bi, dtype=torch.long))
-        cls_list.append(labels[:, 0].long())
-        bboxes_list.append(labels[:, 1:5].float())
+    for list_id, json_list in dataset.items():
+        print(f"\n========= Processing List {list_id} =========")
 
-    imgs_t = torch.stack(imgs)   # B,3,H,W
-    irs_t = torch.stack(irs)     # B,1,H,W  (or zeros if missing)
+        list_results = []
 
-    if len(bboxes_list) == 0:
-        targets = {
-            "batch_idx": torch.zeros((0,), dtype=torch.long),
-            "cls": torch.zeros((0,), dtype=torch.long),
-            "bboxes": torch.zeros((0, 4), dtype=torch.float32),
-        }
-    else:
-        targets = {
-            "batch_idx": torch.cat(batch_idx_list),
-            "cls": torch.cat(cls_list),
-            "bboxes": torch.cat(bboxes_list),
-        }
+        # Prepare concurrent tasks for all items in this list
+        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
 
-    return imgs_t, irs_t, targets
+            futures = {}
+            for item in json_list:
+                q = item["query"]
+                tr = item["trace"]
+                futures[executor.submit(generate_chat, q, tr)] = (q, tr)
+
+            for future in as_completed(futures):
+                query, trace = futures[future]
+
+                try:
+                    answer = future.result()
+                except Exception as e:
+                    answer = f"ERROR: {str(e)}"
+
+                list_results.append({
+                    "query": query,
+                    "trace": trace,
+                    "response": answer
+                })
+
+        all_results[list_id] = list_results
+
+    return all_results
 
 
-# ---------------------------
-# FiLM fusion module
-# - IR encoder -> global pool -> per-scale MLP heads -> produce gamma & beta for channels
-# ---------------------------
-class FiLM_Fuser(nn.Module):
-    def __init__(self, in_ch=1, p3_ch=128, p4_ch=256, p5_ch=512, hidden=64):
-        super().__init__()
-        # small conv encoder for IR (shared)
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_ch, 16, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, 3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.ReLU(),
-        )
-        # global pooling -> MLP
-        self.pool = nn.AdaptiveAvgPool2d(1)  # produce (B,64,1,1)
-        # MLP heads for each scale
-        self.p3_mlp = nn.Sequential(
-            nn.Linear(64, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, p3_ch * 2),  # gamma + beta
-        )
-        self.p4_mlp = nn.Sequential(
-            nn.Linear(64, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, p4_ch * 2),
-        )
-        self.p5_mlp = nn.Sequential(
-            nn.Linear(64, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, p5_ch * 2),
-        )
-
-        # init gamma around 1, beta around 0
-        for m in [self.p3_mlp, self.p4_mlp, self.p5_mlp]:
-            nn.init.zeros_(m[-1].bias)
-            nn.init.normal_(m[-1].weight, mean=0.0, std=0.02)
-
-    def forward(self, ir):
-        """
-        ir: [B,1,H,W]
-        returns: tuple of (gamma3,beta3), (gamma4,beta4), (gamma5,beta5)
-        each gamma/beta shapes: [B, C] (to be unsqueezed to [B,C,1,1])
-        """
-        x = self.encoder(ir)             # B,64,H',W'
-        x = self.pool(x).view(x.shape[0], -1)  # B, 64
-        p3 = self.p3_mlp(x)              # B, 2*C3
-        p4 = self.p4_mlp(x)
-        p5 = self.p5_mlp(x)
-
-        def split_gamma_beta(t):
-            B, v = t.shape
-            C = v // 2
-            gamma = t[:, :C]
-            beta = t[:, C:]
-            # initialize gamma around 1:
-            gamma = 1.0 + 0.1 * torch.tanh(gamma)
-            beta = 0.1 * torch.tanh(beta)
-            return gamma, beta
-
-        g3, b3 = split_gamma_beta(p3)
-        g4, b4 = split_gamma_beta(p4)
-        g5, b5 = split_gamma_beta(p5)
-        return (g3, b3), (g4, b4), (g5, b5)
-
-
-# ---------------------------
-# Custom YOLO wrapper: manual-forward as before but apply FiLM fusion
-# ---------------------------
-class CustomYOLOWithFiLM(nn.Module):
-    def __init__(self, weights_path, film_hidden=64):
-        super().__init__()
-        y = YOLO(weights_path)
-        self.base = y
-        self.model = y.model         # DetectionModel
-        self.layers = self.model.model  # Sequential modules
-        self.names = self.model.names
-
-        # FiLM fuser (in-ch=1 for IR)
-        # Channels for P3, P4, P5 are typical for yolov8n/s: 128,256,512 (we use these by default)
-        self.fuser = FiLM_Fuser(in_ch=1, p3_ch=128, p4_ch=256, p5_ch=512, hidden=film_hidden)
-
-        # criterion created later after moving model to device
-        self.criterion = None
-
-    def build_loss(self, device):
-        # create loss AFTER moving model to device (so internal tensors are on correct device)
-        self.criterion = v8DetectionLoss(self.model)
-        # ensure internal buffers are on the right device (defensive)
-        try:
-            self.criterion.proj = self.criterion.proj.to(device)
-        except Exception:
-            pass
-        try:
-            self.criterion.bbox_loss = self.criterion.bbox_loss.to(device)
-        except Exception:
-            pass
-
-    def forward(self, rgb, ir):
-        """
-        rgb: [B,3,H,W], ir: [B,1,H,W]
-        returns preds (whatever Detect returns)
-        """
-        layers = self.layers
-        x = rgb
-
-        # ------------------- backbone (0..9) producing P3,P4,P5 -------------------
-        P3 = P4 = P5 = None
-        for i, m in enumerate(layers):
-            x = m(x)
-            if i == 4:
-                P3 = x
-            if i == 6:
-                P4 = x
-            if i == 9:
-                P5 = x
-                break
-
-        # ------------------- FiLM fusion using IR -------------------
-        # get gammas and betas
-        (g3, b3), (g4, b4), (g5, b5) = self.fuser(ir)
-        # unsqueeze to match spatial dims
-        def apply_film(P, g, b):
-            # P: [B, C, H, W], g/b: [B, C]
-            g = g.view(g.shape[0], g.shape[1], 1, 1).to(P.dtype).to(P.device)
-            b = b.view(b.shape[0], b.shape[1], 1, 1).to(P.dtype).to(P.device)
-            return g * P + b
-
-        P3 = apply_film(P3, g3, b3)
-        P4 = apply_film(P4, g4, b4)
-        P5 = apply_film(P5, g5, b5)
-
-        # ------------------- neck (10..21) replication (as validated earlier) -------------------
-        P5_up = layers[10](P5)
-        F4 = layers[11]([P5_up, P4])
-        P4_out = layers[12](F4)
-
-        P4_up = layers[13](P4_out)
-        F3 = layers[14]([P4_up, P3])
-        P3_out = layers[15](F3)
-
-        P3_down = layers[16](P3_out)
-        F4b = layers[17]([P3_down, P4_out])
-        P4b = layers[18](F4b)
-
-        P4_down = layers[19](P4b)
-        F5b = layers[20]([P4_down, P5])
-        P5b = layers[21](F5b)
-
-        # detect head
-        detect = layers[22]
-        preds = detect([P3_out, P4b, P5b])
-        return preds
-
-
-# ---------------------------
-# TRAINING LOOP (device-safe)
-# ---------------------------
-def train(args):
-    device = args.device if torch.cuda.is_available() and "cuda" in args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[info] device = {device}")
-
-    # dataset + loader
-    ds = RGBIR_YOLOTxtDataset(args.rgb_dir, args.ir_dir, args.labels_dir, imgsz=args.img)
-    dl = DataLoader(ds, batch_size=args.batch, shuffle=True, collate_fn=collate_fn, num_workers=0)
-
-    # model
-    model = CustomYOLOWithFiLM(args.weights, film_hidden=args.film_hidden)
-    model = model.to(device)
-
-    # now build loss on correct device
-    model.build_loss(device)
-
-    optimizer = torch.optim.Adam(list(model.parameters()), lr=args.lr)
-
-    model.train()
-    start_time = time.time()
-
-    for epoch in range(1, args.epochs + 1):
-        print(f"\n=== Epoch {epoch}/{args.epochs} ===")
-        epoch_loss = 0.0
-        n_batches = 0
-        t0 = time.time()
-
-        for imgs, irs, targets in dl:
-            imgs = imgs.to(device)
-            irs = irs.to(device)
-            # move target tensors to device
-            tgt = {k: v.to(device) for k, v in targets.items()}
-
-            preds = model(imgs, irs)
-
-            # v8DetectionLoss returns (loss_vec_scaled, loss_items)
-            loss_vec_scaled, loss_items = model.criterion(preds, tgt)
-
-            # convert to scalar for backward (loss_vec_scaled is tensor of 3 elements scaled by batch_size)
-            loss_scalar = loss_vec_scaled.sum()
-
-            optimizer.zero_grad()
-            loss_scalar.backward()
-            optimizer.step()
-
-            epoch_loss += float(loss_scalar.item())
-            n_batches += 1
-
-            # loss_items is detached tensor of 3 per-component losses
-            box, cls, dfl = loss_items.tolist()
-            print(f"batch {n_batches} | total:{loss_scalar.item():.4f} box:{box:.4f} cls:{cls:.4f} dfl:{dfl:.4f}")
-
-        avg = epoch_loss / max(1, n_batches)
-        print(f"Epoch {epoch} done in {(time.time()-t0):.1f}s avg_loss={avg:.4f}")
-
-        # save checkpoint
-        ckpt = f"custom_film_epoch{epoch}.pt"
-        torch.save(model.state_dict(), ckpt)
-        print(f"[info] saved {ckpt}")
-
-    print(f"Training finished in {(time.time()-start_time)/60:.2f} minutes")
-
-
-# ---------------------------
-# CLI
-# ---------------------------
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--rgb_dir", required=True, help="path to RGB images folder")
-    p.add_argument("--ir_dir", required=True, help="path to IR images folder (same filenames expected)")
-    p.add_argument("--labels_dir", required=True, help="path to YOLO txt labels folder")
-    p.add_argument("--weights", default="yolov8n.pt", help="yolov8 weights .pt")
-    p.add_argument("--img", type=int, default=640)
-    p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--film_hidden", type=int, default=64, help="hidden dim for FiLM MLP")
-    return p.parse_args()
-
-
+# ---------------- Example use ----------------
 if __name__ == "__main__":
-    args = parse_args()
-    train(args)
+    dataset = {
+        1: [
+            {"query": "Solve 1+1", "trace": "simple addition"},
+            {"query": "Multiply 5×9", "trace": "basic multiplication"},
+        ]
+    }
+
+    results = process_dataset(dataset)
+    json.dump(results, open("outputs.json", "w"), indent=2)
+
+    print("DONE. Saved to outputs.json")
