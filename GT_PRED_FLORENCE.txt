@@ -2,54 +2,56 @@ import json
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ------------------ vLLM SERVER ------------------
 client = OpenAI(
-    base_url="http://0.0.0.0:8002/v1",   # your vLLM endpoint
+    base_url="http://0.0.0.0:8002/v1",
     api_key="not-needed"
 )
 
-MODEL_ID = "deepseek"       # your served-model-name
-MAX_CONCURRENCY = 43        # from your vLLM limits
+MODEL_ID = "deepseek"
+MAX_CONCURRENCY = 43
 
 
-# ------------------ CHAT CALL ------------------
 def generate_chat(query: str, trace: str):
-
-    # minimal payload (no temperature, top_p, max_tokens, seed)
     payload = {
         "model": MODEL_ID,
         "messages": [
-            {
-                "role": "user",
-                "content": f"{query} and {trace}"
-            }
+            {"role": "user", "content": f"{query} and {trace}"}
         ]
     }
 
     try:
         res = client.chat.completions.create(**payload)
-        return res.choices[0].message["content"]
+        return res.choices[0].message.content
     except Exception as e:
         return f"ERROR: {str(e)}"
 
 
-# ------------------ PROCESS DATASET ------------------
 def process_dataset(dataset_path: str, output_path: str):
 
-    # Load dataset.json
+    # Load input dataset
     with open(dataset_path, "r") as f:
         dataset = json.load(f)
 
-    all_results = {}
+    # Load previous partial outputs if the file exists (resume)
+    try:
+        with open(output_path, "r") as f:
+            saved_output = json.load(f)
+    except FileNotFoundError:
+        saved_output = {}
 
     for list_id, items in dataset.items():
+
+        # Skip if already completed earlier
+        if str(list_id) in saved_output:
+            print(f"Skipping list {list_id} (already completed).")
+            continue
+
         print(f"\n========= Processing List {list_id} =========")
 
         list_results = []
 
-        # create thread pool
+        # Process items concurrently
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
-
             futures = {
                 executor.submit(generate_chat, item["query"], item["trace"]): item
                 for item in items
@@ -57,7 +59,8 @@ def process_dataset(dataset_path: str, output_path: str):
 
             for future in as_completed(futures):
                 item = futures[future]
-                query, trace = item["query"], item["trace"]
+                query = item["query"]
+                trace = item["trace"]
 
                 try:
                     answer = future.result()
@@ -70,18 +73,12 @@ def process_dataset(dataset_path: str, output_path: str):
                     "response": answer
                 })
 
-        all_results[list_id] = list_results
+        # Save JUST this list immediately
+        saved_output[str(list_id)] = list_results
 
-    # save outputs
-    with open(output_path, "w") as f:
-        json.dump(all_results, f, indent=2)
+        with open(output_path, "w") as f:
+            json.dump(saved_output, f, indent=2)
 
-    print(f"\nDONE. Saved output to {output_path}")
+        print(f"Saved list {list_id} to {output_path}")
 
-
-# ------------------ RUN ------------------
-if __name__ == "__main__":
-    process_dataset(
-        dataset_path="dataset.json",     # your input file
-        output_path="outputs.json"       # output file
-    )
+    print("\nAll done!")
