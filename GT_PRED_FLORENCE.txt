@@ -1,19 +1,21 @@
+import json
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
 
-# vLLM server endpoint
+# ------------------ vLLM SERVER ------------------
 client = OpenAI(
-    base_url="http://0.0.0.0:8002/v1",
+    base_url="http://0.0.0.0:8002/v1",   # your vLLM endpoint
     api_key="not-needed"
 )
 
-MODEL_ID = "deepseek"
+MODEL_ID = "deepseek"       # your served-model-name
+MAX_CONCURRENCY = 43        # from your vLLM limits
 
 
-# ---------------- Helper: one chat call ----------------
-def generate_chat(query: str, trace: str, temperature=0.2):
+# ------------------ CHAT CALL ------------------
+def generate_chat(query: str, trace: str):
 
+    # minimal payload (no temperature, top_p, max_tokens, seed)
     payload = {
         "model": MODEL_ID,
         "messages": [
@@ -21,40 +23,41 @@ def generate_chat(query: str, trace: str, temperature=0.2):
                 "role": "user",
                 "content": f"{query} and {trace}"
             }
-        ],
-        "temperature": temperature,
-        "top_p": 0.95,
-        "seed": 42,
-        "max_tokens": 256
+        ]
     }
 
     try:
-        response = client.chat.completions.create(**payload)
-        return response.choices[0].message["content"]
+        res = client.chat.completions.create(**payload)
+        return res.choices[0].message["content"]
     except Exception as e:
         return f"ERROR: {str(e)}"
 
 
-# ---------------- Process Dataset ----------------
-def process_dataset(dataset: dict, max_concurrency: int = 43):
+# ------------------ PROCESS DATASET ------------------
+def process_dataset(dataset_path: str, output_path: str):
+
+    # Load dataset.json
+    with open(dataset_path, "r") as f:
+        dataset = json.load(f)
+
     all_results = {}
 
-    for list_id, json_list in dataset.items():
+    for list_id, items in dataset.items():
         print(f"\n========= Processing List {list_id} =========")
 
         list_results = []
 
-        # Prepare concurrent tasks for all items in this list
-        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
+        # create thread pool
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
 
-            futures = {}
-            for item in json_list:
-                q = item["query"]
-                tr = item["trace"]
-                futures[executor.submit(generate_chat, q, tr)] = (q, tr)
+            futures = {
+                executor.submit(generate_chat, item["query"], item["trace"]): item
+                for item in items
+            }
 
             for future in as_completed(futures):
-                query, trace = futures[future]
+                item = futures[future]
+                query, trace = item["query"], item["trace"]
 
                 try:
                     answer = future.result()
@@ -69,19 +72,16 @@ def process_dataset(dataset: dict, max_concurrency: int = 43):
 
         all_results[list_id] = list_results
 
-    return all_results
+    # save outputs
+    with open(output_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+
+    print(f"\nDONE. Saved output to {output_path}")
 
 
-# ---------------- Example use ----------------
+# ------------------ RUN ------------------
 if __name__ == "__main__":
-    dataset = {
-        1: [
-            {"query": "Solve 1+1", "trace": "simple addition"},
-            {"query": "Multiply 5×9", "trace": "basic multiplication"},
-        ]
-    }
-
-    results = process_dataset(dataset)
-    json.dump(results, open("outputs.json", "w"), indent=2)
-
-    print("DONE. Saved to outputs.json")
+    process_dataset(
+        dataset_path="dataset.json",     # your input file
+        output_path="outputs.json"       # output file
+    )
