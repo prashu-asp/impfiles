@@ -1,49 +1,300 @@
-def process_dataset(dataset_path: str, output_dir: str):
-    # Load dataset
-    with open(dataset_path, "r", encoding="utf-8") as f:
-        dataset = json.load(f)
+# train_custom_yolo.py
+import os
+import math
+import time
+from pathlib import Path
+from typing import List, Tuple, Dict
 
-    os.makedirs(output_dir, exist_ok=True)
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import functional as TF
+from PIL import Image
 
-    for list_id, items in dataset.items():
-        list_key = str(list_id)
-        output_file = os.path.join(output_dir, f"list_{list_key}.jsonl")
+# Optional: albumentations for augmentations (install: pip install albumentations opencv-python)
+try:
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+except Exception:
+    A = None
+    ToTensorV2 = None
 
-        # Skip if already processed
-        if os.path.exists(output_file):
-            print(f"Skipping list {list_key} (already exists).")
-            continue
+# -------------------------
+# === USER-SPECIFIC IMPORTS
+# -------------------------
+# Replace this import with the correct path for your v8 detection loss implementation.
+# Example from your repo: from ultralytics.utils.loss import v8DetectionLoss
+# Or if you put it locally: from utils.loss import v8DetectionLoss
+try:
+    from utils.loss import v8DetectionLoss  # <- change to your path
+except Exception:
+    # Fallback stub so code structure remains clear. Replace with your real import.
+    class v8DetectionLoss(nn.Module):
+        def __init__(self, model, tal_topk: int = 10):
+            super().__init__()
+            # This is a stub: replace with the actual loss implementation
+            self.model = model
 
-        print(f"\n========= Processing List {list_key} =========")
+        def forward(self, preds, labels):
+            # preds and labels should match your actual model/loss interface
+            # Return a scalar tensor (loss) and a dict of loss components
+            return torch.tensor(0.0, device=preds[0].device), {"box": 0.0, "obj": 0.0, "cls": 0.0}
 
-        # We will append JSON objects line by line
-        with open(output_file, "w", encoding="utf-8") as out_f:
 
-            with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
-                futures = {
-                    executor.submit(generate_chat, item["query"], item["trace"]): item
-                    for item in items
-                }
+# -------------------------
+# === Dataset: YOLO TXT format
+# -------------------------
+# Expects image files and .txt files with YOLO format:
+# <class> <x_center_rel> <y_center_rel> <w_rel> <h_rel>   (values in [0,1])
+# One bbox per line. Files share same basename, e.g. img/0001.jpg and labels/0001.txt
 
-                for future in as_completed(futures):
-                    item = futures[future]
-                    query = item["query"]
-                    trace = item["trace"]
+class YoloDataset(Dataset):
+    def __init__(self, image_dir: str, label_dir: str, img_size: int = 640, augment: bool = True):
+        self.image_dir = Path(image_dir)
+        self.label_dir = Path(label_dir)
+        self.img_size = img_size
+        self.augment = augment
+        self.images = sorted([p for p in self.image_dir.glob("*") if p.suffix.lower() in [".jpg", ".jpeg", ".png"]])
 
-                    try:
-                        answer = future.result()
-                    except Exception as e:
-                        answer = f"ERROR: {str(e)}"
+        if A is None and self.augment:
+            print("Warning: albumentations not available; augmentations disabled.")
+            self.augment = False
 
-                    record = {
-                        "query": query,
-                        "trace": trace,
-                        "response": answer
-                    }
+        # Albumentations pipeline (flip, brightness, mosaic could be added separately)
+        if self.augment:
+            self.aug = A.Compose([
+                A.Resize(img_size, img_size),
+                A.HorizontalFlip(p=0.5),
+                A.RandomBrightnessContrast(p=0.3),
+                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10, p=0.5),
+                ToTensorV2(),
+            ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
+        else:
+            # simple resize + to tensor
+            self.aug = A.Compose([
+                A.Resize(img_size, img_size),
+                ToTensorV2(),
+            ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels'])) if A else None
 
-                    # Write a single json object as one line (JSONL)
-                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    def __len__(self):
+        return len(self.images)
 
-        print(f"Saved: {output_file}")
+    def read_labels(self, label_path: Path):
+        boxes = []
+        classes = []
+        if not label_path.exists():
+            return boxes, classes
+        with open(label_path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 5:
+                    continue
+                c = int(parts[0])
+                x_center, y_center, w, h = map(float, parts[1:5])
+                # For albumentations 'yolo' format, bbox should be (x_center, y_center, w, h)
+                boxes.append([x_center, y_center, w, h])
+                classes.append(c)
+        return boxes, classes
 
-    print("\nAll done!")
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        label_path = self.label_dir / (img_path.stem + ".txt")
+        image = Image.open(img_path).convert("RGB")
+        image_np = np.array(image)
+
+        boxes, classes = self.read_labels(label_path)
+
+        # Albumentations expects normalized yolo boxes if format='yolo' and resize applied
+        if self.aug:
+            transformed = self.aug(image=image_np, bboxes=boxes, class_labels=classes)
+            img_tensor = transformed['image']  # tensor [C, H, W], already normalized 0-1
+            bboxes = transformed['bboxes']
+            class_labels = transformed['class_labels']
+            # Convert to target format used by loss: list of [class, x_center, y_center, w, h] per bbox (normalized)
+            targets = torch.zeros((len(bboxes), 5), dtype=torch.float32)
+            for i, (b, c) in enumerate(zip(bboxes, class_labels)):
+                targets[i, 0] = c
+                targets[i, 1:] = torch.tensor(b, dtype=torch.float32)
+        else:
+            # fallback: simple PIL -> tensor and no bboxes transformed
+            img_tensor = TF.to_tensor(image.resize((self.img_size, self.img_size)))
+            targets = torch.zeros((len(boxes), 5), dtype=torch.float32)
+            for i, (b, c) in enumerate(zip(boxes, classes)):
+                targets[i, 0] = c
+                targets[i, 1:] = torch.tensor(b, dtype=torch.float32)
+
+        return img_tensor, targets  # img tensor [3,H,W], targets [num_boxes, 5]
+
+
+# -------------------------
+# === Helper utilities
+# -------------------------
+import numpy as np
+def collate_fn(batch):
+    imgs = [b[0] for b in batch]
+    targets = [b[1] for b in batch]
+    # Stack images into tensor [B,3,H,W]
+    imgs = torch.stack(imgs, dim=0)
+    # targets will be a list of tensors (variable number of boxes); we keep it as list
+    return imgs, targets
+
+
+# -------------------------
+# === Model creation
+# -------------------------
+def create_model(device: torch.device, model_cfg: str = None, pretrained_weights: str = None) -> nn.Module:
+    """
+    Two options:
+     - If you have ultralytics YOLOv8 installed and want to load a model by name/path, you can do that.
+     - Otherwise, provide a ready torch.nn.Module.
+    """
+    try:
+        # Option: use Ultralytics package if available (they expose models as nn.Module)
+        # pip install ultralytics
+        from ultralytics import YOLO  # type: ignore
+        if pretrained_weights:
+            yolo = YOLO(pretrained_weights)  # loads weights; treat as module
+        elif model_cfg:
+            yolo = YOLO(model_cfg)  # yaml config
+        else:
+            # fallback: use a small built-in yolov8n if ultralytics package present
+            yolo = YOLO('yolov8n.pt')
+
+        # The ultralytics YOLO object wraps model; get underlying nn.Module via yolo.model
+        model = getattr(yolo, 'model', yolo)  # keep YOLO wrapper if needed
+        model.to(device)
+        return model
+    except Exception as e:
+        print("Ultralytics YOLO not available or failed to load. Provide your own model.")
+        raise e
+
+
+# -------------------------
+# === Training Loop
+# -------------------------
+def train(
+    train_loader: DataLoader,
+    model: nn.Module,
+    loss_fn: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epochs: int = 50,
+    val_loader: DataLoader = None,
+    save_dir: str = "./runs",
+    grad_accum: int = 1,
+    amp: bool = True,
+):
+    scaler = torch.cuda.amp.GradScaler(enabled=amp and device.type == 'cuda')
+    os.makedirs(save_dir, exist_ok=True)
+    global_step = 0
+
+    # Example LR scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs * len(train_loader))
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        t0 = time.time()
+        for i, (imgs, targets) in enumerate(train_loader):
+            imgs = imgs.to(device, non_blocking=True)  # [B,3,H,W]
+            # targets is list of tensors per image with shape [N_i, 5] where col0 is class and others are yolo coords
+            # The v8DetectionLoss used in the repo expects model predictions (model(imgs)) and labels in a certain format.
+            # Make sure to adapt the targets formatting to that required by your loss (class index dtype, etc).
+
+            optimizer.zero_grad() if grad_accum == 1 else None
+            with torch.cuda.amp.autocast(enabled=amp and device.type == 'cuda'):
+                preds = model(imgs)  # adapt depending on model API: could be list of detections per image or a tensor
+                # If ultralytics model returns a wrapper, you may need model.model(imgs) or model.model(imgs).pred
+                # Compute detection loss using v8DetectionLoss
+                loss, loss_items = loss_fn(preds, targets)  # expects (loss_tensor, dict)
+                # If your v8DetectionLoss returns a dict or tuple, adapt accordingly.
+
+            scaler.scale(loss / grad_accum).backward()
+            if (i + 1) % grad_accum == 0:
+                # optional gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
+            epoch_loss += float(loss.detach().cpu())
+
+            global_step += 1
+
+            if global_step % 50 == 0:
+                lr = optimizer.param_groups[0]['lr']
+                print(f"Epoch {epoch+1}/{epochs} Step {i+1}/{len(train_loader)} loss {loss.item():.4f} lr {lr:.6e}")
+
+        t1 = time.time()
+        avg_loss = epoch_loss / len(train_loader)
+        print(f"Epoch {epoch+1} done in {t1-t0:.1f}s avg_loss={avg_loss:.4f}")
+
+        # Save checkpoint
+        ckpt = {
+            'model_state': model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'epoch': epoch + 1,
+        }
+        torch.save(ckpt, os.path.join(save_dir, f"checkpoint_epoch{epoch+1}.pt"))
+
+        # optional: run validation
+        if val_loader is not None:
+            evaluate(model, val_loader, device)
+
+    return model
+
+
+# -------------------------
+# === Simple evaluation placeholder
+# -------------------------
+def evaluate(model: nn.Module, val_loader: DataLoader, device: torch.device):
+    model.eval()
+    # Placeholder: compute basic loss or run NMS + mAP calculation externally
+    total = 0
+    with torch.no_grad():
+        for imgs, targets in val_loader:
+            imgs = imgs.to(device)
+            preds = model(imgs)
+            total += 1
+    print(f"Ran evaluation on {total} batches")
+
+
+# -------------------------
+# === Main: configure everything here
+# -------------------------
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--img_dir", type=str, default="data/images/train")
+    parser.add_argument("--label_dir", type=str, default="data/labels/train")
+    parser.add_argument("--val_img_dir", type=str, default="data/images/val")
+    parser.add_argument("--val_label_dir", type=str, default="data/labels/val")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--img_size", type=int, default=640)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--weights", type=str, default=None, help="path to pretrained weights or ultralytics .pt")
+    parser.add_argument("--save_dir", type=str, default="./runs/custom_yolo")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_ds = YoloDataset(args.img_dir, args.label_dir, img_size=args.img_size, augment=True)
+    val_ds = YoloDataset(args.val_img_dir, args.val_label_dir, img_size=args.img_size, augment=False)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=8, collate_fn=collate_fn, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=True)
+
+    # create model (adjust to your model)
+    model = create_model(device, pretrained_weights=args.weights)
+
+    # instantiate v8 detection loss with the model (this is how ultralytics ties loss to anchors/backbone)
+    loss_fn = v8DetectionLoss(model)  # adjust args if your constructor differs
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.937, weight_decay=0.0005)
+
+    train(train_loader, model, loss_fn, optimizer, device, epochs=args.epochs, val_loader=val_loader, save_dir=args.save_dir)
+
+
+if __name__ == "__main__":
+    main()
