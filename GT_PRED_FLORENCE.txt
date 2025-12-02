@@ -1,25 +1,33 @@
 from ultralytics.utils.ops import non_max_suppression
 
 @torch.no_grad()
-def predict(self, x, conf=0.25, iou=0.45):
-    # Forward returns feature maps, not flattened output
-    feats = self.forward(x)
+def predict(self, x, conf=0.25, iou=0.45, max_det=300):
+    """
+    Convert raw model output into boxes + scores + classes.
+    Similar to Ultralytics predict().
+    """
+    preds = self.forward(x)   # raw predictions from Detect head
 
-    # Detect head
-    detect = self.layers[22]
+    # preds is a list of feature maps → combine along anchor dimension
+    # Detect.forward returns (B, no, H*W) for each level
+    detect = self.layers[22]   # final detect head
+    
+    # This handles bbox decoding + score formatting
+    decoded = detect.predict(preds, batch=x.shape[0])
 
-    # Decode raw predictions from feature maps
-    decoded = detect.forward_export(feats)
+    # Now decoded → (B, total_preds, 6) → [x1,y1,x2,y2,score,class]
+    results = []
+    for i in range(len(decoded)):
+        boxes = non_max_suppression(
+            decoded[i].unsqueeze(0),  # shape: (1, N, 6)
+            conf_thres=conf,
+            iou_thres=iou,
+            max_det=max_det
+        )[0]
 
-    # decoded: (B, num_preds, 84)  → apply NMS
-    preds = non_max_suppression(
-        decoded,
-        conf_thres=conf,
-        iou_thres=iou,
-        nc=self.model.nc
-    )
+        results.append(boxes)  # tensor(N,6)
 
-    return preds
+    return results
 
 #====================================================================
 
@@ -87,4 +95,5 @@ for epoch in range(epochs):
     print(f" Recall:      {val_results['recall']:.4f}")
     print(f" mAP@50:      {val_results['map50']:.4f}")
     print(f" mAP@50-95:   {val_results['map']:.4f}")
+
 
