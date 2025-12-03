@@ -1,151 +1,212 @@
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
+from ultralytics import YOLO
+from ultralytics.cfg import get_cfg
+from ultralytics.utils import DEFAULT_CFG_PATH
+from ultralytics.utils.nms import non_max_suppression
 
 
-# ---------------------------------------------------------------
-#  IoU Matrix (Vectorized)
-# ---------------------------------------------------------------
-def box_iou_matrix(a, b):
-    """
-    a: [N, 4]
-    b: [M, 4]
-    Returns IoU matrix [N, M]
-    """
-    inter_x1 = torch.max(a[:, None, 0], b[:, 0])
-    inter_y1 = torch.max(a[:, None, 1], b[:, 1])
-    inter_x2 = torch.min(a[:, None, 2], b[:, 2])
-    inter_y2 = torch.min(a[:, None, 3], b[:, 3])
+# -------------------------------------------------------
+# FiLM IR conditioning module (your original design)
+# -------------------------------------------------------
+class FiLM_IR(nn.Module):
+    def __init__(self, ir_channels=1, out_channels=512):
+        super().__init__()
 
-    inter_w = (inter_x2 - inter_x1).clamp(min=0)
-    inter_h = (inter_y2 - inter_y1).clamp(min=0)
-    inter_area = inter_w * inter_h
+        self.encoder = nn.Sequential(
+            nn.Conv2d(ir_channels, 32, 3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.SiLU(),
 
-    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
-    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.SiLU(),
 
-    union = area_a[:, None] + area_b - inter_area
-    return inter_area / union.clamp(min=1e-6)
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.SiLU(),
+        )
+
+        # project IR → gamma, beta
+        self.fc = nn.Sequential(
+            nn.Linear(128, 256),
+            nn.SiLU(),
+            nn.Linear(256, out_channels * 2),
+        )
+
+        self.out_channels = out_channels
+
+    def forward(self, p5, ir):
+        B, C, _, _ = p5.shape
+
+        f = self.encoder(ir)                  # (B,128,H/8,W/8)
+        f = torch.mean(f, dim=[2, 3])         # GAP → (B,128)
+
+        gamma_beta = self.fc(f)               # (B, 2C)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+
+        gamma = gamma.view(B, C, 1, 1)
+        beta  = beta.view(B, C, 1, 1)
+
+        # *** residual FiLM ***
+        return p5 * (1 + gamma) + beta
+    
 
 
-# ---------------------------------------------------------------
-#  Class-wise NMS (Stable, YOLO-Style)
-# ---------------------------------------------------------------
-def classwise_nms(boxes, scores, labels, iou_thres=0.45):
-    """
-    Performs class-wise NMS.
-    Returns final indices of boxes to keep.
-    """
-    device = boxes.device
-    unique_classes = labels.unique()
+# -------------------------------------------------------
+#               Custom YOLO With FiLM
+# -------------------------------------------------------
+class CustomYOLO(nn.Module):
+    def __init__(self, weights_path="yolov8s.pt", nc=8, device=None):
+        super().__init__()
 
-    final_boxes = []
-    final_scores = []
-    final_labels = []
+        self.nc = nc
+        self.reg_max = 16
+        self.bbox_bins = self.reg_max * 4           # 64
+        self.no = self.nc + self.bbox_bins          # 8 + 64 = 72
 
-    for cls in unique_classes:
-        cls_mask = labels == cls
-        b = boxes[cls_mask]
-        s = scores[cls_mask]
+        # --------------------------
+        # Device
+        # --------------------------
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
 
-        if b.size(0) == 0:
-            continue
+        # --------------------------
+        # Load YOLOv8 model
+        # --------------------------
+        base = YOLO(weights_path).model
+        self.model = base
+        self.layers = base.model
+        self.detect = self.layers[-1]
 
-        # sort by score
-        order = s.argsort(descending=True)
-        b = b[order]
-        s = s[order]
+        # --------------------------
+        # Update model config
+        # --------------------------
+        cfg = get_cfg(DEFAULT_CFG_PATH)
+        cfg.nc = self.nc
+        self.model.args = cfg
 
-        keep = []
-        while b.size(0) > 0:
-            # top box
-            keep.append((b[0], s[0], cls))
+        # --------------------------
+        # FiLM module (use P5 channels)
+        # --------------------------
+        p5_ch = self.layers[9].cv2.conv.out_channels  # SPPF output channels
+        self.film = FiLM_IR(ir_channels=1, out_channels=p5_ch)
 
-            if b.size(0) == 1:
+        # --------------------------
+        # Rebuild detect head correctly
+        # --------------------------
+        self.rebuild_detect_head()
+
+        self.to(self.device)
+
+
+
+    # -------------------------------------------------------
+    # Correct YOLOv8 Detect Rebuild (ONLY cv3 is changed)
+    # -------------------------------------------------------
+    def rebuild_detect_head(self):
+        d = self.detect
+
+        d.nc = self.nc
+        d.no = self.no  # 8 classes + 64 DFL bins
+
+        # ------ rebuild cv3 (classification head) ------
+        d.cv3 = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(c, c, 3, padding=1, bias=False),
+                nn.BatchNorm2d(c),
+                nn.SiLU(),
+
+                nn.Conv2d(c, c, 3, padding=1, bias=False),
+                nn.BatchNorm2d(c),
+                nn.SiLU(),
+
+                nn.Conv2d(c, self.nc, 1)
+            )
+            for c in d.channels
+        ])
+
+        print("✔ Detect head rebuilt for", self.nc, "classes")
+        print("  cv3 outputs:", [m[-1].out_channels for m in d.cv3])
+        print("  Training output no =", d.no)
+
+
+
+    # -------------------------------------------------------
+    #   Manual Backbone → FiLM → Neck Reconstruction
+    # -------------------------------------------------------
+    def forward_features(self, x4):
+        """
+        Full YOLOv8 backbone + FiLM + neck
+        Returns: [P3_out, P4b, P5b]
+        """
+
+        rgb = x4[:, :3]
+        ir  = x4[:, 3:].to(self.device)
+
+        layers = self.layers
+        xi = rgb
+        P3 = P4 = P5 = None
+
+        # backbone (0..9)
+        for i, m in enumerate(layers):
+            xi = m(xi)
+
+            if i == 4:   P3 = xi
+            if i == 6:   P4 = xi
+            if i == 9:
+                P5 = xi
                 break
 
-            # compute IoU with remaining
-            ious = box_iou_matrix(b[0:1], b[1:]).squeeze(0)
-            mask = ious < iou_thres
+        # ----- Apply FiLM to P5 -----
+        P5 = self.film(P5, ir)
 
-            b = b[1:][mask]
-            s = s[1:][mask]
+        # ----- Neck -----
+        P5_up = layers[10](P5)
+        F4 = layers[11]([P5_up, P4])
+        P4_out = layers[12](F4)
 
-        for bb, ss, cc in keep:
-            final_boxes.append(bb)
-            final_scores.append(ss)
-            final_labels.append(cc)
+        P4_up = layers[13](P4_out)
+        F3 = layers[14]([P4_up, P3])
+        P3_out = layers[15](F3)
 
-    if len(final_boxes) == 0:
-        return torch.tensor([], dtype=torch.long, device=device)
+        P3_down = layers[16](P3_out)
+        F4b = layers[17]([P3_down, P4_out])
+        P4b = layers[18](F4b)
 
-    # stack results
-    final_scores = torch.stack(final_scores)
-    _, sorted_idx = final_scores.sort(descending=True)
+        P4_down = layers[19](P4b)
+        F5b = layers[20]([P4_down, P5])
+        P5b = layers[21](F5b)
 
-    # create fake indices (we will index manually later)
-    return sorted_idx
+        return [P3_out, P4b, P5b]
 
 
-# ---------------------------------------------------------------
-#  YOLOv8 POSTPROCESSING
-# ---------------------------------------------------------------
-def yolov8_postprocess(outputs, conf_threshold=0.25, iou_threshold=0.45, max_detections=300):
-    """
-    outputs: [B, nc+4, 8400]
-    returns: list of [N, 6] tensors → x1,y1,x2,y2,score,class
-    """
-    B, C, N = outputs.shape
-    nc = C - 4
 
-    outputs = outputs.permute(0, 2, 1)  # [B, 8400, nc+4]
+    # -------------------------------------------------------
+    # FORWARD = detect(features)
+    # Training → raw 72-channel output
+    # Eval     → decoded 12-channel output
+    # -------------------------------------------------------
+    def forward(self, x4):
+        feats = self.forward_features(x4)
+        return self.detect(feats)
 
-    boxes = outputs[:, :, :4]           # (cx,cy,w,h)
-    class_logits = outputs[:, :, 4:]    # class scores
 
-    class_probs = torch.sigmoid(class_logits)
 
-    # cx,cy,w,h → x1,y1,x2,y2
-    cx, cy, w, h = boxes.unbind(-1)
-    x1 = cx - w / 2
-    y1 = cy - h / 2
-    x2 = cx + w / 2
-    y2 = cy + h / 2
-    boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
+    # -------------------------------------------------------
+    # INFERENCE WRAPPER
+    # -------------------------------------------------------
+    @torch.no_grad()
+    def predict(self, x, conf=0.25, iou=0.45, max_det=300):
+        self.eval()
 
-    results = []
+        raw = self.forward(x)   # (B, 12, 8400)
 
-    for i in range(B):
-        bboxes = boxes_xyxy[i]        # [8400,4]
-        probs = class_probs[i]        # [8400,nc]
+        return non_max_suppression(
+            raw,
+            conf_thres=conf,
+            iou_thres=iou,
+            max_det=max_det
+        )
 
-        # pick highest class per box
-        scores, labels = probs.max(dim=1)
-
-        # confidence threshold
-        mask = scores > conf_threshold
-        bboxes = bboxes[mask]
-        scores = scores[mask]
-        labels = labels[mask]
-
-        if bboxes.size(0) == 0:
-            results.append(torch.zeros((0, 6)))
-            continue
-
-        # perform YOLO-style classwise NMS
-        keep_idx = classwise_nms(bboxes, scores, labels, iou_thres=iou_threshold)
-
-        keep_idx = keep_idx[:max_detections]  # limit detections
-
-        final_boxes = bboxes[keep_idx]
-        final_scores = scores[keep_idx]
-        final_labels = labels[keep_idx].float()
-
-        det = torch.cat([
-            final_boxes,
-            final_scores.unsqueeze(1),
-            final_labels.unsqueeze(1)
-        ], dim=1)
-
-        results.append(det)
-
-    return results
