@@ -1,212 +1,233 @@
 import torch
-import torch.nn as nn
-from ultralytics import YOLO
-from ultralytics.cfg import get_cfg
-from ultralytics.utils import DEFAULT_CFG_PATH
-from ultralytics.utils.nms import non_max_suppression
+from torch.utils.data import DataLoader
+from ultralytics.utils.loss import v8DetectionLoss
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
 
 
-# -------------------------------------------------------
-# FiLM IR conditioning module (your original design)
-# -------------------------------------------------------
-class FiLM_IR(nn.Module):
-    def __init__(self, ir_channels=1, out_channels=512):
-        super().__init__()
+def train_model(
+    model,
+    train_dataset,
+    val_dataset=None,
+    epochs=50,
+    batch_size=8,
+    lr=1e-3,
+    device="cuda",
+    save_path="custom_yolo_best.pt",
+):
 
-        self.encoder = nn.Sequential(
-            nn.Conv2d(ir_channels, 32, 3, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.SiLU(),
+    device = torch.device(device)
+    model.to(device)
+    model.train()
 
-            nn.Conv2d(32, 64, 3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.SiLU(),
+    # Loss function (IMPORTANT: use underlying YOLO detect model)
+    criterion = v8DetectionLoss(model.model)
 
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.SiLU(),
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
+    # Dataloaders
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=4, collate_fn=train_dataset.collate_fn
+    )
+
+    if val_dataset:
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size,
+            shuffle=False, num_workers=4, collate_fn=val_dataset.collate_fn
         )
+    else:
+        val_loader = None
 
-        # project IR → gamma, beta
-        self.fc = nn.Sequential(
-            nn.Linear(128, 256),
-            nn.SiLU(),
-            nn.Linear(256, out_channels * 2),
-        )
+    best_map50 = -1
 
-        self.out_channels = out_channels
+    for epoch in range(epochs):
 
-    def forward(self, p5, ir):
-        B, C, _, _ = p5.shape
+        model.train()
+        total_loss = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
 
-        f = self.encoder(ir)                  # (B,128,H/8,W/8)
-        f = torch.mean(f, dim=[2, 3])         # GAP → (B,128)
+        for imgs4, labels in pbar:
+            imgs4 = imgs4.to(device)
 
-        gamma_beta = self.fc(f)               # (B, 2C)
-        gamma, beta = gamma_beta.chunk(2, dim=1)
+            # build batch_dict for v8 loss
+            batch_idx = []
+            cls_list = []
+            bbox_list = []
 
-        gamma = gamma.view(B, C, 1, 1)
-        beta  = beta.view(B, C, 1, 1)
+            for i, t in enumerate(labels):
+                if t.numel() == 0:
+                    continue
+                batch_idx.append(torch.full((t.size(0),), i, device=device, dtype=torch.long))
+                cls_list.append(t[:, 0].long().to(device))
+                bbox_list.append(t[:, 1:5].float().to(device))
 
-        # *** residual FiLM ***
-        return p5 * (1 + gamma) + beta
-    
+            if len(cls_list) > 0:
+                batch_idx = torch.cat(batch_idx)
+                cls = torch.cat(cls_list)
+                bboxes = torch.cat(bbox_list)
+            else:
+                batch_idx = torch.zeros((0,), device=device, dtype=torch.long)
+                cls = torch.zeros((0,), device=device, dtype=torch.long)
+                bboxes = torch.zeros((0,4), device=device, dtype=torch.float)
 
+            batch_dict = {"batch_idx": batch_idx, "cls": cls, "bboxes": bboxes}
 
-# -------------------------------------------------------
-#               Custom YOLO With FiLM
-# -------------------------------------------------------
-class CustomYOLO(nn.Module):
-    def __init__(self, weights_path="yolov8s.pt", nc=8, device=None):
-        super().__init__()
+            # forward pass
+            preds = model(imgs4)
 
-        self.nc = nc
-        self.reg_max = 16
-        self.bbox_bins = self.reg_max * 4           # 64
-        self.no = self.nc + self.bbox_bins          # 8 + 64 = 72
+            # loss
+            loss_vec, _ = criterion(preds, batch_dict)
+            loss = loss_vec.sum()
 
-        # --------------------------
-        # Device
-        # --------------------------
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        # --------------------------
-        # Load YOLOv8 model
-        # --------------------------
-        base = YOLO(weights_path).model
-        self.model = base
-        self.layers = base.model
-        self.detect = self.layers[-1]
+            total_loss += loss.item()
+            pbar.set_postfix({"loss": loss.item()})
 
-        # --------------------------
-        # Update model config
-        # --------------------------
-        cfg = get_cfg(DEFAULT_CFG_PATH)
-        cfg.nc = self.nc
-        self.model.args = cfg
+        scheduler.step()
 
-        # --------------------------
-        # FiLM module (use P5 channels)
-        # --------------------------
-        p5_ch = self.layers[9].cv2.conv.out_channels  # SPPF output channels
-        self.film = FiLM_IR(ir_channels=1, out_channels=p5_ch)
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_loss:.4f}")
 
-        # --------------------------
-        # Rebuild detect head correctly
-        # --------------------------
-        self.rebuild_detect_head()
+        # Validation (optional)
+        if val_loader:
+            map50, cls_acc = validate_model(model, val_loader, device)
+            print(f"Validation → mAP@50: {map50:.4f},  Class Acc: {cls_acc:.4f}")
 
-        self.to(self.device)
+            # Save best model
+            if map50 > best_map50:
+                best_map50 = map50
+                torch.save(model.state_dict(), save_path)
+                print("✔ Saved Best Model")
+
+    # Final save
+    torch.save(model.state_dict(), save_path.replace(".pt", "_final.pt"))
+    print("Training complete.")
 
 
 
-    # -------------------------------------------------------
-    # Correct YOLOv8 Detect Rebuild (ONLY cv3 is changed)
-    # -------------------------------------------------------
-    def rebuild_detect_head(self):
-        d = self.detect
-
-        d.nc = self.nc
-        d.no = self.no  # 8 classes + 64 DFL bins
-
-        # ------ rebuild cv3 (classification head) ------
-        d.cv3 = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(c, c, 3, padding=1, bias=False),
-                nn.BatchNorm2d(c),
-                nn.SiLU(),
-
-                nn.Conv2d(c, c, 3, padding=1, bias=False),
-                nn.BatchNorm2d(c),
-                nn.SiLU(),
-
-                nn.Conv2d(c, self.nc, 1)
-            )
-            for c in d.channels
-        ])
-
-        print("✔ Detect head rebuilt for", self.nc, "classes")
-        print("  cv3 outputs:", [m[-1].out_channels for m in d.cv3])
-        print("  Training output no =", d.no)
+#==========================================================================================
 
 
 
-    # -------------------------------------------------------
-    #   Manual Backbone → FiLM → Neck Reconstruction
-    # -------------------------------------------------------
-    def forward_features(self, x4):
-        """
-        Full YOLOv8 backbone + FiLM + neck
-        Returns: [P3_out, P4b, P5b]
-        """
+import torch
+from PIL import Image
+import numpy as np
 
-        rgb = x4[:, :3]
-        ir  = x4[:, 3:].to(self.device)
 
-        layers = self.layers
-        xi = rgb
-        P3 = P4 = P5 = None
+def load_rgbir_image(rgb_path, ir_path, img_size=640):
+    rgb = Image.open(rgb_path).convert("RGB").resize((img_size, img_size))
+    ir  = Image.open(ir_path).convert("L").resize((img_size, img_size))
 
-        # backbone (0..9)
-        for i, m in enumerate(layers):
-            xi = m(xi)
+    rgb = torch.from_numpy(np.array(rgb)/255.0).permute(2,0,1)
+    ir  = torch.from_numpy(np.array(ir)/255.0).unsqueeze(0)
 
-            if i == 4:   P3 = xi
-            if i == 6:   P4 = xi
-            if i == 9:
-                P5 = xi
-                break
+    return torch.cat([rgb, ir], dim=0).float()
 
-        # ----- Apply FiLM to P5 -----
-        P5 = self.film(P5, ir)
 
-        # ----- Neck -----
-        P5_up = layers[10](P5)
-        F4 = layers[11]([P5_up, P4])
-        P4_out = layers[12](F4)
+@torch.no_grad()
+def infer(model, rgb_path, ir_path, img_size=640, device="cuda", conf=0.25):
+    model.eval()
+    device = torch.device(device)
 
-        P4_up = layers[13](P4_out)
-        F3 = layers[14]([P4_up, P3])
-        P3_out = layers[15](F3)
+    x = load_rgbir_image(rgb_path, ir_path, img_size).unsqueeze(0).to(device)
 
-        P3_down = layers[16](P3_out)
-        F4b = layers[17]([P3_down, P4_out])
-        P4b = layers[18](F4b)
+    detections = model.predict(x, conf=conf)
 
-        P4_down = layers[19](P4b)
-        F5b = layers[20]([P4_down, P5])
-        P5b = layers[21](F5b)
+    # detections[0] → Nx6 tensor
+    return detections[0]
 
-        return [P3_out, P4b, P5b]
+from custom_yolo import CustomYOLO
+model = CustomYOLO("custom_yolo_best.pt", nc=8, device="cuda")
+model.load_state_dict(torch.load("custom_yolo_best.pt"))
+
+out = infer(model, "rgb.jpg", "ir.jpg")
+print(out)
 
 
 
-    # -------------------------------------------------------
-    # FORWARD = detect(features)
-    # Training → raw 72-channel output
-    # Eval     → decoded 12-channel output
-    # -------------------------------------------------------
-    def forward(self, x4):
-        feats = self.forward_features(x4)
-        return self.detect(feats)
+#================================================================
 
 
 
-    # -------------------------------------------------------
-    # INFERENCE WRAPPER
-    # -------------------------------------------------------
-    @torch.no_grad()
-    def predict(self, x, conf=0.25, iou=0.45, max_det=300):
-        self.eval()
+import torch
+from tqdm import tqdm
 
-        raw = self.forward(x)   # (B, 12, 8400)
+def box_iou(box1, box2):
+    """
+    box1: [N,4], box2: [M,4]
+    returns IoU matrix [N,M]
+    """
+    area1 = (box1[:,2]-box1[:,0]) * (box1[:,3]-box1[:,1])
+    area2 = (box2[:,2]-box2[:,0]) * (box2[:,3]-box2[:,1])
 
-        return non_max_suppression(
-            raw,
-            conf_thres=conf,
-            iou_thres=iou,
-            max_det=max_det
-        )
+    lt = torch.max(box1[:,None,:2], box2[:,:2])
+    rb = torch.min(box1[:,None,2:], box2[:,2:])
 
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:,:,0] * wh[:,:,1]
+    union = area1[:,None] + area2 - inter
+    return inter / union.clamp(min=1e-6)
+
+
+@torch.no_grad()
+def validate_model(model, val_loader, device="cuda", conf=0.25, iou_thres=0.5):
+
+    model.eval()
+    device = torch.device(device)
+
+    correct_cls = 0
+    total_cls = 0
+
+    tp = 0
+    fp = 0
+    fn = 0
+
+    for imgs4, labels in tqdm(val_loader, desc="Validating"):
+        imgs4 = imgs4.to(device)
+        preds = model.predict(imgs4, conf=conf)
+
+        for i, det in enumerate(preds):
+            gt = labels[i].to(device)   # [N,5]
+
+            if det is None or gt.numel() == 0:
+                if gt.numel() > 0:
+                    fn += gt.size(0)  # all missed
+                continue
+
+            # DET: [x1,y1,x2,y2,conf,cls]
+            pred_box = det[:, :4]
+            pred_cls = det[:, 5].long()
+
+            # GT: [cls, x, y, w, h] normalized
+            gx, gy, gw, gh = gt[:,1], gt[:,2], gt[:,3], gt[:,4]
+            x1 = (gx - gw/2); y1 = (gy - gh/2)
+            x2 = (gx + gw/2); y2 = (gy + gh/2)
+            gt_box = torch.stack([x1, y1, x2, y2], dim=1)
+
+            iou = box_iou(pred_box, gt_box)
+
+            max_iou, idx = iou.max(dim=1)
+
+            # true positives
+            match = max_iou > iou_thres
+
+            tp += match.sum().item()
+            fp += (~match).sum().item()
+            fn += (gt.size(0) - match.sum().item())
+
+            # classification accuracy
+            matched_gt_cls = gt[idx][match][:,0].long()
+            matched_pred_cls = pred_cls[match]
+
+            correct_cls += (matched_pred_cls == matched_gt_cls).sum().item()
+            total_cls   += matched_pred_cls.numel()
+
+    map50 = tp / (tp + fp + 1e-6)
+    cls_acc = correct_cls / (total_cls + 1e-6)
+
+    return map50, cls_acc
