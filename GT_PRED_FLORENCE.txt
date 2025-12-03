@@ -1,3 +1,17 @@
+x = torch.randn(1, 4, 640, 640).to(device)
+
+feats = model.forward_features(x)
+print([f.shape for f in feats])
+
+decoded = model.decode(feats)
+print("decoded shape:", decoded.shape)
+
+results = model.predict(x)
+print("final:", results[0].shape)
+print(results[0])
+
+
+#=====================================================================
 from ultralytics.utils.ops import non_max_suppression
 import torch
 import torch.nn as nn
@@ -222,6 +236,7 @@ for epoch in range(epochs):
     print(f" Recall:      {val_results['recall']:.4f}")
     print(f" mAP@50:      {val_results['map50']:.4f}")
     print(f" mAP@50-95:   {val_results['map']:.4f}")
+
 
 
 
