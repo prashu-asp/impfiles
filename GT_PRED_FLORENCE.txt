@@ -1,33 +1,78 @@
 from ultralytics.utils.ops import non_max_suppression
 
 @torch.no_grad()
+def decode(self, feats):
+    """
+    Convert raw YOLOv8 head outputs (P3,P4,P5) into decoded xyxy + score + cls.
+    feats = [P3_out, P4b, P5b]
+    """
+
+    detect = self.layers[22]  # YOLOv8 Detect head
+
+    stride = detect.stride
+    reg_max = detect.reg_max
+    nc = detect.nc
+    no = nc + reg_max * 4
+    device = feats[0].device
+
+    # -----------------------------------------------------
+    # Build anchors for all levels (80x80, 40x40, 20x20)
+    # -----------------------------------------------------
+    anchor_points, stride_tensor = make_anchors(feats, stride, 0.5)
+
+    # -----------------------------------------------------
+    # Flatten all feature maps (merge all anchors)
+    # -----------------------------------------------------
+    B = feats[0].shape[0]
+    feats = [f.view(B, no, -1) for f in feats]  # (B,84,H*W)
+
+    # Split bbox distribution + class logits
+    pred_distri, pred_scores = torch.cat(feats, dim=2).split((reg_max * 4, nc), dim=1)
+
+    # Move channels to last dim
+    pred_distri = pred_distri.permute(0, 2, 1)  # (B,N,regmax*4)
+    pred_scores = pred_scores.permute(0, 2, 1).sigmoid()
+
+    # -----------------------------------------------------
+    # DFL decoding: convert distribution → distances
+    # -----------------------------------------------------
+    proj = torch.arange(reg_max, device=device, dtype=torch.float32)
+    pred_d = pred_distri.view(B, -1, 4, reg_max).softmax(3)
+    pred_d = pred_d.matmul(proj)  # (B,N,4)
+
+    # -----------------------------------------------------
+    # Convert distances → xyxy boxes
+    # -----------------------------------------------------
+    boxes = dist2bbox(pred_d, anchor_points, xywh=False)
+    boxes *= stride_tensor  # pixel scaling
+
+    # -----------------------------------------------------
+    # Final YOLO output: (x1,y1,x2,y2, score, cls...)
+    # -----------------------------------------------------
+    out = torch.cat((boxes, pred_scores), dim=-1)
+
+    return out  # shape (B, N, 4+nc)
+
+
+@torch.no_grad()
 def predict(self, x, conf=0.25, iou=0.45, max_det=300):
-    """
-    Convert raw model output into boxes + scores + classes.
-    Similar to Ultralytics predict().
-    """
-    preds = self.forward(x)   # raw predictions from Detect head
+    # get raw multi-scale outputs
+    feats = self.forward(x)
 
-    # preds is a list of feature maps → combine along anchor dimension
-    # Detect.forward returns (B, no, H*W) for each level
-    detect = self.layers[22]   # final detect head
-    
-    # This handles bbox decoding + score formatting
-    decoded = detect.predict(preds, batch=x.shape[0])
+    # decode them
+    decoded = self.decode(feats)  # (B,N,4+nc)
 
-    # Now decoded → (B, total_preds, 6) → [x1,y1,x2,y2,score,class]
-    results = []
-    for i in range(len(decoded)):
-        boxes = non_max_suppression(
-            decoded[i].unsqueeze(0),  # shape: (1, N, 6)
-            conf_thres=conf,
-            iou_thres=iou,
-            max_det=max_det
-        )[0]
-
-        results.append(boxes)  # tensor(N,6)
+    # run YOLO NMS
+    results = non_max_suppression(
+        decoded,
+        conf_thres=conf,
+        iou_thres=iou,
+        max_det=max_det,
+        nc=self.model.nc
+    )
 
     return results
+
 
 #====================================================================
 
@@ -95,5 +140,6 @@ for epoch in range(epochs):
     print(f" Recall:      {val_results['recall']:.4f}")
     print(f" mAP@50:      {val_results['map50']:.4f}")
     print(f" mAP@50-95:   {val_results['map']:.4f}")
+
 
 
