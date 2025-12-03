@@ -238,6 +238,377 @@ for epoch in range(epochs):
     print(f" mAP@50-95:   {val_results['map']:.4f}")
 
 
+#≈===================
+
+
+# custom_yolo_training.py
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import numpy as np
+from ultralytics import YOLO
+from ultralytics.cfg import get_cfg
+from ultralytics.utils import DEFAULT_CFG_PATH
+from ultralytics.utils.nms import non_max_suppression
+from ultralytics.utils.tal import make_anchors, dist2bbox
+from ultralytics.utils.loss import v8DetectionLoss
+
+
+# -------------------------
+# Dataset: RGB + IR -> 4-channel
+# -------------------------
+class YoloRGBIRDataset(Dataset):
+    def __init__(self, rgb_dir, ir_dir, label_dir, img_size=640):
+        self.rgb_dir = rgb_dir
+        self.ir_dir = ir_dir
+        self.label_dir = label_dir
+        self.img_size = img_size
+        self.files = sorted([f for f in os.listdir(rgb_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+
+    def load_image(self, path, mode="RGB"):
+        img = Image.open(path)
+        img = img.resize((self.img_size, self.img_size))
+        if mode == "RGB":
+            img = img.convert("RGB")
+            arr = np.array(img, dtype=np.float32) / 255.0
+            return torch.from_numpy(arr).permute(2, 0, 1)  # (3,H,W)
+        else:
+            img = img.convert("L")
+            arr = np.array(img, dtype=np.float32) / 255.0
+            return torch.from_numpy(arr)[None, ...]        # (1,H,W)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        fname = self.files[idx]
+        rgb_path = os.path.join(self.rgb_dir, fname)
+        ir_path = os.path.join(self.ir_dir, fname)
+        label_path = os.path.join(self.label_dir, fname.rsplit('.', 1)[0] + '.txt')
+
+        rgb = self.load_image(rgb_path, mode="RGB")
+        ir = self.load_image(ir_path, mode="IR")
+        img4 = torch.cat([rgb, ir], dim=0)  # (4,H,W)
+
+        targets = []
+        if os.path.exists(label_path):
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        cls, x, y, w, h = map(float, parts[:5])
+                        targets.append([cls, x, y, w, h])
+        if len(targets):
+            targets = torch.tensor(targets, dtype=torch.float32)
+        else:
+            targets = torch.zeros((0, 5), dtype=torch.float32)
+
+        return img4, targets
+
+
+def collate_fn(batch):
+    imgs = torch.stack([b[0] for b in batch], dim=0)
+    labels = [b[1] for b in batch]
+    return imgs, labels
+
+
+# -------------------------
+# IR FiLM extractor (produces gamma,beta at 1/32 spatial)
+# -------------------------
+class IRFiLMExtractor(nn.Module):
+    def __init__(self, base_ch=56, out_ch=128):
+        super().__init__()
+        # stages: /2, /4, /8, /16, /32
+        self.stage1 = nn.Sequential(nn.Conv2d(1, base_ch, 3, stride=2, padding=1), nn.SiLU())
+        self.stage2 = nn.Sequential(nn.Conv2d(base_ch, base_ch*2, 3, stride=2, padding=1), nn.SiLU())
+        self.stage3 = nn.Sequential(nn.Conv2d(base_ch*2, base_ch*4, 3, stride=2, padding=1), nn.SiLU())
+        self.stage4 = nn.Sequential(nn.Conv2d(base_ch*4, base_ch*8, 3, stride=2, padding=1), nn.SiLU())
+        self.stage5 = nn.Sequential(nn.Conv2d(base_ch*8, base_ch*16, 3, stride=2, padding=1), nn.SiLU())  # 1/32
+
+        self.to_gamma = nn.Conv2d(base_ch*16, out_ch, 1)
+        self.to_beta  = nn.Conv2d(base_ch*16, out_ch, 1)
+
+    def forward(self, ir):
+        """
+        ir: (B,1,H,W)
+        returns gamma,beta: (B,out_ch,H/32,W/32)
+        """
+        f1 = self.stage1(ir)
+        f2 = self.stage2(f1)
+        f3 = self.stage3(f2)
+        f4 = self.stage4(f3)
+        f5 = self.stage5(f4)  # final deepest features at /32
+
+        gamma = self.to_gamma(f5)
+        beta  = self.to_beta(f5)
+        return gamma, beta
+
+
+# -------------------------
+# Custom YOLO class
+# - forward() returns feats list [P3,P4,P5]  (used for training & v8DetectionLoss)
+# - predict() does decode + NMS (inference-only)
+# -------------------------
+class CustomYOLO(nn.Module):
+    def __init__(self, weights_path: str, device=None):
+        super().__init__()
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+
+        base = YOLO(weights_path).model         # internal DetectionModel
+        self.model = base
+        self.layers = base.model                # backbone+neck+detect list
+        self.detect = self.layers[-1]           # Detect module
+        self.nc = base.nc
+
+        # ensure model args exist (contains hyp)
+        cfg = get_cfg(DEFAULT_CFG_PATH)
+        cfg.nc = self.nc
+        self.model.args = cfg
+
+        # get P5 channels automatically (SPPF output)
+        # layer 9 is SPPF in typical YOLOv8 architectures
+        p5_ch = self.layers[9].cv2.conv.out_channels
+
+        # IR FiLM extractor: produce gamma,beta matching P5 channels and P5 spatial resolution
+        self.film = IRFiLMExtractor(base_ch=56, out_ch=p5_ch)
+
+        # move modules to device
+        self.to(self.device)
+
+    def forward_features(self, x4):
+        """Return [P3_out, P4b, P5b] (feature maps) — used by loss and decode"""
+        # x4: (B,4,H,W)
+        rgb = x4[:, :3, :, :]
+        ir = x4[:, 3:, :, :]
+
+        layers = self.layers
+        xi = rgb
+        P3 = P4 = P5 = None
+
+        # run backbone until SPPF (indices depend on model; standard is 0..9)
+        for i, m in enumerate(layers):
+            xi = m(xi)
+            if i == 4:
+                P3 = xi
+            if i == 6:
+                P4 = xi
+            if i == 9:
+                P5 = xi
+                break
+
+        # apply FiLM: produce gamma,beta at /32 spatial size to match P5
+        gamma, beta = self.film(ir.to(P5.device))
+        # residual modulation requested: P5 = P5 * (1+gamma) + beta
+        P5 = P5 * (1.0 + gamma) + beta
+
+        # Neck reconstruction (same ordering as original YOLOv8)
+        P5_up = layers[10](P5)
+        F4 = layers[11]([P5_up, P4])
+        P4_out = layers[12](F4)
+
+        P4_up = layers[13](P4_out)
+        F3 = layers[14]([P4_up, P3])
+        P3_out = layers[15](F3)
+
+        P3_down = layers[16](P3_out)
+        F4b = layers[17]([P3_down, P4_out])
+        P4b = layers[18](F4b)
+
+        P4_down = layers[19](P4b)
+        F5b = layers[20]([P4_down, P5])
+        P5b = layers[21](F5b)
+
+        return [P3_out, P4b, P5b]
+
+    def forward(self, x4):
+        """During training we return the feature-list (not detect flattened) — v8DetectionLoss expects this."""
+        feats = self.forward_features(x4)
+        return feats
+
+    # ----------------------------
+    # decode from detect raw outputs (optionally)
+    # We will use detect to convert feats -> raw preds then decode them.
+    # ----------------------------
+    @torch.no_grad()
+    def decode_from_feats(self, feats):
+        """
+        Accepts feats = [P3,P4,P5], applies detect head convs -> get raw (B,no,N) and then
+        convert to (B,N,4+nc) using DFL + anchors.
+        """
+        # first get raw predict tensor by invoking detect on feats
+        # detect will apply convs on each feature map and return flattened (B,no,N)
+        raw = self.detect(feats)  # (B, no, total_anchors)
+
+        # now decode from raw
+        B, no, N = raw.shape
+        reg_max = self.detect.reg_max
+        nc = self.detect.nc
+        device = raw.device
+
+        # split distribution and class logits
+        box_channels = reg_max * 4
+        pred_distri = raw[:, :box_channels, :].permute(0, 2, 1)   # (B,N,box_channels)
+        pred_scores = raw[:, box_channels:, :].permute(0, 2, 1).sigmoid()  # (B,N,nc)
+
+        # DFL decode: (B,N,4)
+        proj = torch.arange(reg_max, device=device, dtype=torch.float32)
+        pred_d = pred_distri.view(B, N, 4, reg_max).softmax(-1)
+        pred_d = pred_d.matmul(proj)
+
+        # anchor points require original feats + detect.stride
+        anchor_points, stride_tensor = make_anchors(feats, self.detect.stride, 0.5)
+
+        boxes = dist2bbox(pred_d, anchor_points, xywh=False)
+        boxes = boxes * stride_tensor  # scale to pixels
+
+        decoded = torch.cat([boxes, pred_scores], dim=-1)  # (B,N,4+nc)
+        return decoded
+
+    @torch.no_grad()
+    def predict(self, x4, conf=0.25, iou=0.45, max_det=300):
+        feats = self.forward_features(x4)
+        decoded = self.decode_from_feats(feats)  # (B,N,4+nc)
+        results = non_max_suppression(decoded, conf_thres=conf, iou_thres=iou, max_det=max_det, nc=self.nc)
+        return results
+
+
+# -------------------------
+# Training loop
+# -------------------------
+def train(
+    weights_path,
+    train_rgb_dir,
+    train_ir_dir,
+    train_label_dir,
+    val_rgb_dir=None,
+    val_ir_dir=None,
+    val_label_dir=None,
+    epochs=10,
+    batch_size=8,
+    img_size=640,
+    lr=1e-3,
+    device=None,
+    save_path="custom_yolo_best.pt",
+):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # dataset + loader
+    train_ds = YoloRGBIRDataset(train_rgb_dir, train_ir_dir, train_label_dir, img_size=img_size)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+
+    val_loader = None
+    if val_rgb_dir and val_ir_dir and val_label_dir:
+        val_ds = YoloRGBIRDataset(val_rgb_dir, val_ir_dir, val_label_dir, img_size=img_size)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+
+    # model
+    custom = CustomYOLO(weights_path, device=device)
+    custom.train()  # set training mode on custom model (this sets submodules accordingly)
+    custom.to(device)
+
+    # loss expects the *internal* DetectionModel to be passed so it reads hyp and detect config:
+    loss_fn = v8DetectionLoss(custom.model)  # custom.model is the ultralytics DetectionModel
+
+    # optimizer — must optimize parameters of the custom wrapper (includes base.model parameters)
+    optimizer = torch.optim.AdamW(custom.parameters(), lr=lr, weight_decay=5e-4)
+
+    best_map = -1.0
+
+    for epoch in range(epochs):
+        custom.train()
+        total_loss = 0.0
+        for imgs4, labels in train_loader:
+            imgs4 = imgs4.to(device)
+
+            # build batch_dict as expected by v8DetectionLoss
+            all_batch_idx = []
+            all_cls = []
+            all_bboxes = []
+
+            for i, t in enumerate(labels):
+                if t is None or t.numel() == 0:
+                    continue
+                t = t.to(device)
+                # t: [num_obj, 5] -> [cls, x_center, y_center, w, h] normalized
+                all_batch_idx.append(torch.full((t.shape[0],), i, device=device, dtype=torch.long))
+                all_cls.append(t[:, 0].to(device))
+                # convert xywh normalized into same format expected by loss (they expect xywh scaled later)
+                all_bboxes.append(t[:, 1:5].to(device))
+
+            if len(all_cls) > 0:
+                batch_idx = torch.cat(all_batch_idx)
+                cls = torch.cat(all_cls)
+                bboxes = torch.cat(all_bboxes)
+            else:
+                batch_idx = torch.zeros((0,), device=device, dtype=torch.long)
+                cls = torch.zeros((0,), device=device, dtype=torch.long)
+                bboxes = torch.zeros((0, 4), device=device, dtype=torch.float32)
+
+            batch_dict = {"batch_idx": batch_idx, "cls": cls, "bboxes": bboxes}
+
+            # forward: returns feats list -> v8DetectionLoss expects this
+            feats = custom(imgs4)  # list of 3 tensors
+            loss_vec, loss_items = loss_fn(feats, batch_dict)  # (3,) -> box, cls, dfl
+            loss = loss_vec.sum()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{epochs}  train_loss: {avg_loss:.4f}")
+
+        # -- optional validation (quick mAP using predict)
+        if val_loader is not None:
+            custom.eval()
+            with torch.no_grad():
+                all_maps = []
+                for imgs4, labels in val_loader:
+                    imgs4 = imgs4.to(device)
+                    outputs = custom.predict(imgs4, conf=0.001)  # list of tensors per image
+                    # You can compute mAP here with a proper evaluator (COCO/Pascal style).
+                    # For brevity we only show number of detections per batch.
+                    for out in outputs:
+                        if out is None:
+                            print("no detections for an image")
+                        else:
+                            print("detections:", out.shape)
+            # (Add proper metric computation if needed)
+
+        # save checkpoint each epoch
+        torch.save(custom.state_dict(), f"{save_path}.epoch{epoch+1}.pt")
+
+    # final save
+    torch.save(custom.state_dict(), save_path)
+    print("Training finished. Saved:", save_path)
+
+
+# -------------------------
+# Example usage (edit paths)
+# -------------------------
+if __name__ == "__main__":
+    train(
+        weights_path="yolov8s.pt",
+        train_rgb_dir="data/images_rgb/train",
+        train_ir_dir="data/images_ir/train",
+        train_label_dir="data/labels/train",
+        val_rgb_dir=None,
+        val_ir_dir=None,
+        val_label_dir=None,
+        epochs=10,
+        batch_size=4,
+        img_size=640,
+        lr=1e-3,
+        device=None,
+        save_path="runs/custom_rgbir_film",
+    )
 
 
 
