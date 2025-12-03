@@ -1,77 +1,159 @@
 from ultralytics.utils.ops import non_max_suppression
+import torch
+import torch.nn as nn
+from ultralytics import YOLO
 
-@torch.no_grad()
-def decode(self, feats):
-    """
-    Convert raw YOLOv8 head outputs (P3,P4,P5) into decoded xyxy + score + cls.
-    feats = [P3_out, P4b, P5b]
-    """
+from ultralytics.utils.nms import non_max_suppression
+from ultralytics.utils.tal import make_anchors, dist2bbox
 
-    detect = self.layers[22]  # YOLOv8 Detect head
+# -------------------------------------------------------------------------
+# Your IR FILM Extractor (unchanged)
+# -------------------------------------------------------------------------
+class IRFiLMExtractor(nn.Module):
+    def __init__(self, base_ch=56, out_ch=128):
+        super().__init__()
 
-    stride = detect.stride
-    reg_max = detect.reg_max
-    nc = detect.nc
-    no = nc + reg_max * 4
-    device = feats[0].device
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(1, base_ch, 3, stride=2, padding=1),
+            nn.SiLU()
+        )
+        self.stage2 = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch * 2, 3, stride=2, padding=1),
+            nn.SiLU()
+        )
+        self.stage3 = nn.Sequential(
+            nn.Conv2d(base_ch * 2, base_ch * 4, 3, stride=2, padding=1),
+            nn.SiLU()
+        )
+        self.stage4 = nn.Sequential(
+            nn.Conv2d(base_ch * 4, base_ch * 8, 3, stride=2, padding=1),
+            nn.SiLU()
+        )
 
-    # -----------------------------------------------------
-    # Build anchors for all levels (80x80, 40x40, 20x20)
-    # -----------------------------------------------------
-    anchor_points, stride_tensor = make_anchors(feats, stride, 0.5)
+        self.to_gamma = nn.Conv2d(base_ch * 8, out_ch, 1)
+        self.to_beta  = nn.Conv2d(base_ch * 8, out_ch, 1)
 
-    # -----------------------------------------------------
-    # Flatten all feature maps (merge all anchors)
-    # -----------------------------------------------------
-    B = feats[0].shape[0]
-    feats = [f.view(B, no, -1) for f in feats]  # (B,84,H*W)
+    def forward(self, ir):
+        f1 = self.stage1(ir)
+        f2 = self.stage2(f1)
+        f3 = self.stage3(f2)
+        f4 = self.stage4(f3)
 
-    # Split bbox distribution + class logits
-    pred_distri, pred_scores = torch.cat(feats, dim=2).split((reg_max * 4, nc), dim=1)
-
-    # Move channels to last dim
-    pred_distri = pred_distri.permute(0, 2, 1)  # (B,N,regmax*4)
-    pred_scores = pred_scores.permute(0, 2, 1).sigmoid()
-
-    # -----------------------------------------------------
-    # DFL decoding: convert distribution → distances
-    # -----------------------------------------------------
-    proj = torch.arange(reg_max, device=device, dtype=torch.float32)
-    pred_d = pred_distri.view(B, -1, 4, reg_max).softmax(3)
-    pred_d = pred_d.matmul(proj)  # (B,N,4)
-
-    # -----------------------------------------------------
-    # Convert distances → xyxy boxes
-    # -----------------------------------------------------
-    boxes = dist2bbox(pred_d, anchor_points, xywh=False)
-    boxes *= stride_tensor  # pixel scaling
-
-    # -----------------------------------------------------
-    # Final YOLO output: (x1,y1,x2,y2, score, cls...)
-    # -----------------------------------------------------
-    out = torch.cat((boxes, pred_scores), dim=-1)
-
-    return out  # shape (B, N, 4+nc)
+        gamma = self.to_gamma(f4)
+        beta = self.to_beta(f4)
+        return gamma, beta
 
 
-@torch.no_grad()
-def predict(self, x, conf=0.25, iou=0.45, max_det=300):
-    # get raw multi-scale outputs
-    feats = self.forward(x)
+# -------------------------------------------------------------------------
+# Updated CustomYOLO with IRFiLMExtractor
+# -------------------------------------------------------------------------
+class CustomYOLO(nn.Module):
+    def __init__(self, weights_path: str):
+        super().__init__()
 
-    # decode them
-    decoded = self.decode(feats)  # (B,N,4+nc)
+        base = YOLO(weights_path).model
+        self.model = base
+        self.layers = base.model
+        self.detect = self.layers[-1]
+        self.nc = base.nc
+        
+        # --- Get P5 channel count automatically ---
+        p5_channels = self.layers[9].cv2.conv.out_channels
 
-    # run YOLO NMS
-    results = non_max_suppression(
-        decoded,
-        conf_thres=conf,
-        iou_thres=iou,
-        max_det=max_det,
-        nc=self.model.nc
-    )
+        # --- Replace FiLM with your IRFiLMExtractor ---
+        self.film = IRFiLMExtractor(base_ch=56, out_ch=p5_channels)
 
-    return results
+    # ------------------------------------------------------------------
+    # Backbone + Neck (feature extraction only)
+    # ------------------------------------------------------------------
+    def forward_features(self, x4):
+        rgb = x4[:, :3]
+        ir = x4[:, 3:].unsqueeze(1)
+
+        xi = rgb
+        P3 = P4 = P5 = None
+        layers = self.layers
+
+        # -- BACKBONE --
+        for i, m in enumerate(layers):
+            xi = m(xi)
+            if i == 4: P3 = xi
+            if i == 6: P4 = xi
+            if i == 9:
+                P5 = xi
+                break
+
+        # --- IR FiLM Conditioning ---
+        gamma, beta = self.film(ir)
+        P5 = P5 * gamma + beta
+
+        # -- NECK --
+        P5_up  = layers[10](P5)
+        F4     = layers[11]([P5_up, P4])
+        P4_out = layers[12](F4)
+
+        P4_up  = layers[13](P4_out)
+        F3     = layers[14]([P4_up, P3])
+        P3_out = layers[15](F3)
+
+        P3_down = layers[16](P3_out)
+        F4b     = layers[17]([P3_down, P4_out])
+        P4b     = layers[18](F4b)
+
+        P4_down = layers[19](P4b)
+        F5b     = layers[20]([P4_down, P5])
+        P5b     = layers[21](F5b)
+
+        return [P3_out, P4b, P5b]
+
+    # ------------------------------------------------------------------
+    # TRAINING FORWARD
+    # ------------------------------------------------------------------
+    def forward(self, x4):
+        feats = self.forward_features(x4)
+        return self.detect(feats)   # raw YOLO detect output
+
+    # ------------------------------------------------------------------
+    # DECODE + NMS
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def predict(self, x4, conf=0.25, iou=0.45):
+        feats = self.forward_features(x4)
+        decoded = self.decode(feats)
+        return non_max_suppression(decoded, conf, iou, nc=self.nc)
+
+    # ------------------------------------------------------------------
+    # YOLOv8 DFL + anchor decoding
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def decode(self, feats):
+        detect = self.detect
+
+        stride = detect.stride
+        reg_max = detect.reg_max
+        nc = detect.nc
+        no = nc + reg_max * 4
+        device = feats[0].device
+
+        anchor_points, stride_tensor = make_anchors(feats, stride, 0.5)
+
+        B = feats[0].shape[0]
+        feats = [f.view(B, no, -1) for f in feats]
+
+        pred_distri, pred_scores = torch.cat(feats, dim=2).split((reg_max * 4, nc), 1)
+
+        pred_distri = pred_distri.permute(0, 2, 1)
+        pred_scores = pred_scores.permute(0, 2, 1).sigmoid()
+
+        proj = torch.arange(reg_max, device=device)
+        pred_dist = pred_distri.view(B, -1, 4, reg_max).softmax(3)
+        pred_dist = pred_dist.matmul(proj)
+
+        boxes = dist2bbox(pred_dist, anchor_points, xywh=False)
+        boxes *= stride_tensor
+
+        return torch.cat([boxes, pred_scores], dim=-1)
+
 
 
 #====================================================================
@@ -140,6 +222,7 @@ for epoch in range(epochs):
     print(f" Recall:      {val_results['recall']:.4f}")
     print(f" mAP@50:      {val_results['map50']:.4f}")
     print(f" mAP@50-95:   {val_results['map']:.4f}")
+
 
 
 
