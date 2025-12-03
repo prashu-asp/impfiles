@@ -1,231 +1,119 @@
-import torch
-from torch.utils.data import DataLoader
-from ultralytics.utils.loss import v8DetectionLoss
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from tqdm import tqdm
-
-
-def train_model(
-    model,
-    train_dataset,
-    val_dataset=None,
-    epochs=50,
-    batch_size=8,
-    lr=1e-3,
-    device="cuda",
-    save_path="custom_yolo_best.pt",
-):
-
-    device = torch.device(device)
-    model.to(device)
-    model.train()
-
-    # Loss function (IMPORTANT: use underlying YOLO detect model)
-    criterion = v8DetectionLoss(model.model)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=5e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-
-    # Dataloaders
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=4, collate_fn=train_dataset.collate_fn
-    )
-
-    if val_dataset:
-        val_loader = DataLoader(
-            val_dataset, batch_size=batch_size,
-            shuffle=False, num_workers=4, collate_fn=val_dataset.collate_fn
-        )
-    else:
-        val_loader = None
-
-    best_map50 = -1
-
-    for epoch in range(epochs):
-
-        model.train()
-        total_loss = 0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-
-        for imgs4, labels in pbar:
-            imgs4 = imgs4.to(device)
-
-            # build batch_dict for v8 loss
-            batch_idx = []
-            cls_list = []
-            bbox_list = []
-
-            for i, t in enumerate(labels):
-                if t.numel() == 0:
-                    continue
-                batch_idx.append(torch.full((t.size(0),), i, device=device, dtype=torch.long))
-                cls_list.append(t[:, 0].long().to(device))
-                bbox_list.append(t[:, 1:5].float().to(device))
-
-            if len(cls_list) > 0:
-                batch_idx = torch.cat(batch_idx)
-                cls = torch.cat(cls_list)
-                bboxes = torch.cat(bbox_list)
-            else:
-                batch_idx = torch.zeros((0,), device=device, dtype=torch.long)
-                cls = torch.zeros((0,), device=device, dtype=torch.long)
-                bboxes = torch.zeros((0,4), device=device, dtype=torch.float)
-
-            batch_dict = {"batch_idx": batch_idx, "cls": cls, "bboxes": bboxes}
-
-            # forward pass
-            preds = model(imgs4)
-
-            # loss
-            loss_vec, _ = criterion(preds, batch_dict)
-            loss = loss_vec.sum()
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            pbar.set_postfix({"loss": loss.item()})
-
-        scheduler.step()
-
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_loss:.4f}")
-
-        # Validation (optional)
-        if val_loader:
-            map50, cls_acc = validate_model(model, val_loader, device)
-            print(f"Validation → mAP@50: {map50:.4f},  Class Acc: {cls_acc:.4f}")
-
-            # Save best model
-            if map50 > best_map50:
-                best_map50 = map50
-                torch.save(model.state_dict(), save_path)
-                print("✔ Saved Best Model")
-
-    # Final save
-    torch.save(model.state_dict(), save_path.replace(".pt", "_final.pt"))
-    print("Training complete.")
-
-
-
-#==========================================================================================
-
-
-
-import torch
-from PIL import Image
-import numpy as np
-
-
-def load_rgbir_image(rgb_path, ir_path, img_size=640):
-    rgb = Image.open(rgb_path).convert("RGB").resize((img_size, img_size))
-    ir  = Image.open(ir_path).convert("L").resize((img_size, img_size))
-
-    rgb = torch.from_numpy(np.array(rgb)/255.0).permute(2,0,1)
-    ir  = torch.from_numpy(np.array(ir)/255.0).unsqueeze(0)
-
-    return torch.cat([rgb, ir], dim=0).float()
-
-
-@torch.no_grad()
-def infer(model, rgb_path, ir_path, img_size=640, device="cuda", conf=0.25):
-    model.eval()
-    device = torch.device(device)
-
-    x = load_rgbir_image(rgb_path, ir_path, img_size).unsqueeze(0).to(device)
-
-    detections = model.predict(x, conf=conf)
-
-    # detections[0] → Nx6 tensor
-    return detections[0]
-
-from custom_yolo import CustomYOLO
-model = CustomYOLO("custom_yolo_best.pt", nc=8, device="cuda")
-model.load_state_dict(torch.load("custom_yolo_best.pt"))
-
-out = infer(model, "rgb.jpg", "ir.jpg")
-print(out)
-
-
-
-#================================================================
-
-
-
-import torch
-from tqdm import tqdm
-
-def box_iou(box1, box2):
+def yolov8_postprocess(outputs, conf_threshold=0.25, iou_threshold=0.45, max_detections=300, reg_max=16):
     """
-    box1: [N,4], box2: [M,4]
-    returns IoU matrix [N,M]
+    outputs: [B, 72, 8400] -> DFL(64) + class(8)
+    returns list of detections per image: [N,6]
     """
-    area1 = (box1[:,2]-box1[:,0]) * (box1[:,3]-box1[:,1])
-    area2 = (box2[:,2]-box2[:,0]) * (box2[:,3]-box2[:,1])
+    B, C, HW = outputs.shape
+    nc = C - 4 * reg_max  # = 8
 
-    lt = torch.max(box1[:,None,:2], box2[:,:2])
-    rb = torch.min(box1[:,None,2:], box2[:,2:])
+    outputs = outputs.permute(0, 2, 1)       # (B,HW,72)
 
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:,:,0] * wh[:,:,1]
-    union = area1[:,None] + area2 - inter
-    return inter / union.clamp(min=1e-6)
+    # Split
+    pred_dist = outputs[:, :, :4 * reg_max]   # DFL bins
+    pred_cls  = outputs[:, :, 4 * reg_max:]   # Class logits
+
+    # Decode DFL into box distances (l,t,r,b)
+    dfl = dfl_decode(pred_dist, reg_max=reg_max)   # (B,HW,4)
+
+    # Convert distances to box corners
+    # Detect module generates anchor points, but your postprocess needs absolute coords.
+    # Here we assume anchors already applied (training forward uses detect())
+    # So DFL gives x1,y1,x2,y2 directly
+    boxes = dfl
+
+    # Class scores
+    class_probs = torch.sigmoid(pred_cls)
+
+    results = []
+
+    for b in range(B):
+        scores, labels = class_probs[b].max(dim=1)
+
+        mask = scores > conf_threshold
+        if mask.sum() == 0:
+            results.append(torch.zeros((0, 6)))
+            continue
+
+        bboxes = boxes[b][mask]
+        scores = scores[mask]
+        labels = labels[mask]
+
+        keep = classwise_nms(bboxes, scores, labels, iou_threshold)
+
+        keep = keep[:max_detections]
+
+        det = torch.cat([
+            bboxes[keep],
+            scores[keep].unsqueeze(1),
+            labels[keep].float().unsqueeze(1)
+        ], dim=1)
+
+        results.append(det)
+
+    return results
+
+
 
 
 @torch.no_grad()
 def validate_model(model, val_loader, device="cuda", conf=0.25, iou_thres=0.5):
-
     model.eval()
-    device = torch.device(device)
-
+    tp = fp = fn = 0
     correct_cls = 0
     total_cls = 0
 
-    tp = 0
-    fp = 0
-    fn = 0
-
     for imgs4, labels in tqdm(val_loader, desc="Validating"):
         imgs4 = imgs4.to(device)
-        preds = model.predict(imgs4, conf=conf)
+        H, W = imgs4.shape[2], imgs4.shape[3]
+
+        # 1. Get detect output
+        feats = model.forward_features(imgs4)
+        raw = model.detect(feats)
+
+        preds = yolov8_postprocess(raw, conf_threshold=conf)
 
         for i, det in enumerate(preds):
-            gt = labels[i].to(device)   # [N,5]
+            gt = labels[i].to(device)  # [N,5]
 
-            if det is None or gt.numel() == 0:
-                if gt.numel() > 0:
-                    fn += gt.size(0)  # all missed
+            if gt.numel() == 0:
+                if det.size(0) > 0:
+                    fp += det.size(0)
                 continue
 
-            # DET: [x1,y1,x2,y2,conf,cls]
+            # Convert GT to pixel coords
+            gx = gt[:,1] * W
+            gy = gt[:,2] * H
+            gw = gt[:,3] * W
+            gh = gt[:,4] * H
+
+            x1 = gx - gw/2; y1 = gy - gh/2
+            x2 = gx + gw/2; y2 = gy + gh/2
+            gt_box = torch.stack([x1,y1,x2,y2], dim=1)
+
+            # Predictions
+            if det.size(0) == 0:
+                fn += gt.size(0)
+                continue
+
             pred_box = det[:, :4]
             pred_cls = det[:, 5].long()
 
-            # GT: [cls, x, y, w, h] normalized
-            gx, gy, gw, gh = gt[:,1], gt[:,2], gt[:,3], gt[:,4]
-            x1 = (gx - gw/2); y1 = (gy - gh/2)
-            x2 = (gx + gw/2); y2 = (gy + gh/2)
-            gt_box = torch.stack([x1, y1, x2, y2], dim=1)
-
+            # IoU matching
             iou = box_iou(pred_box, gt_box)
-
             max_iou, idx = iou.max(dim=1)
 
-            # true positives
             match = max_iou > iou_thres
 
             tp += match.sum().item()
             fp += (~match).sum().item()
-            fn += (gt.size(0) - match.sum().item())
+            fn += gt.size(0) - match.sum().item()
 
-            # classification accuracy
+            # Class accuracy
             matched_gt_cls = gt[idx][match][:,0].long()
             matched_pred_cls = pred_cls[match]
 
             correct_cls += (matched_pred_cls == matched_gt_cls).sum().item()
-            total_cls   += matched_pred_cls.numel()
+            total_cls += matched_pred_cls.numel()
 
     map50 = tp / (tp + fp + 1e-6)
     cls_acc = correct_cls / (total_cls + 1e-6)
