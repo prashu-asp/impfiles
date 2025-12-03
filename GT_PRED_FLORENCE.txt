@@ -1,57 +1,29 @@
-def yolov8_postprocess(outputs, conf_threshold=0.25, iou_threshold=0.45, max_detections=300, reg_max=16):
+from ultralytics.utils.nms import non_max_suppression
+
+@torch.no_grad()
+def yolo_official_postprocess(model, x, conf=0.25, iou=0.45, max_det=300):
     """
-    outputs: [B, 72, 8400] -> DFL(64) + class(8)
-    returns list of detections per image: [N,6]
+    model: CustomYOLO (your model)
+    x     : input image (4-channel)
+    Returns YOLOv8-style detections.
     """
-    B, C, HW = outputs.shape
-    nc = C - 4 * reg_max  # = 8
 
-    outputs = outputs.permute(0, 2, 1)       # (B,HW,72)
+    model.eval()
 
-    # Split
-    pred_dist = outputs[:, :, :4 * reg_max]   # DFL bins
-    pred_cls  = outputs[:, :, 4 * reg_max:]   # Class logits
+    # Detect.forward() returns DFL-decoded predictions in eval mode
+    raw = model(x)                     # shape: (B, 12, HW)
 
-    # Decode DFL into box distances (l,t,r,b)
-    dfl = dfl_decode(pred_dist, reg_max=reg_max)   # (B,HW,4)
+    # convert to list of NMS outputs
+    preds = non_max_suppression(
+        raw.permute(0, 2, 1),          # (B, HW, 12)
+        conf_thres=conf,
+        iou_thres=iou,
+        max_det=max_det,
+        nc=model.nc                    # your number of classes
+    )
 
-    # Convert distances to box corners
-    # Detect module generates anchor points, but your postprocess needs absolute coords.
-    # Here we assume anchors already applied (training forward uses detect())
-    # So DFL gives x1,y1,x2,y2 directly
-    boxes = dfl
-
-    # Class scores
-    class_probs = torch.sigmoid(pred_cls)
-
-    results = []
-
-    for b in range(B):
-        scores, labels = class_probs[b].max(dim=1)
-
-        mask = scores > conf_threshold
-        if mask.sum() == 0:
-            results.append(torch.zeros((0, 6)))
-            continue
-
-        bboxes = boxes[b][mask]
-        scores = scores[mask]
-        labels = labels[mask]
-
-        keep = classwise_nms(bboxes, scores, labels, iou_threshold)
-
-        keep = keep[:max_detections]
-
-        det = torch.cat([
-            bboxes[keep],
-            scores[keep].unsqueeze(1),
-            labels[keep].float().unsqueeze(1)
-        ], dim=1)
-
-        results.append(det)
-
-    return results
-
+    # preds[i] has shape: (N, 6): [x1,y1,x2,y2,conf,class]
+    return preds
 
 
 
@@ -119,3 +91,4 @@ def validate_model(model, val_loader, device="cuda", conf=0.25, iou_thres=0.5):
     cls_acc = correct_cls / (total_cls + 1e-6)
 
     return map50, cls_acc
+
