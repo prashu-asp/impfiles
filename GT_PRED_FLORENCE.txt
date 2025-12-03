@@ -1,94 +1,143 @@
+import torch
+from tqdm import tqdm
 from ultralytics.utils.nms import non_max_suppression
 
+
+# -----------------------------
+# IoU for validation
+# -----------------------------
+def box_iou(box1, box2):
+    """
+    box1: [N,4], box2:[M,4] in pixels
+    returns IoU matrix [N,M]
+    """
+    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+
+    lt = torch.max(box1[:, None, :2], box2[:, :2])  # top-left
+    rb = torch.min(box1[:, None, 2:], box2[:, 2:])  # bottom-right
+
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    union = area1[:, None] + area2 - inter
+
+    return inter / union.clamp(min=1e-6)
+
+
+
+# ------------------------------------------------------
+# OFFICIAL YOLOv8 POSTPROCESS (B2)
+# ------------------------------------------------------
 @torch.no_grad()
 def yolo_official_postprocess(model, x, conf=0.25, iou=0.45, max_det=300):
     """
-    model: CustomYOLO (your model)
-    x     : input image (4-channel)
-    Returns YOLOv8-style detections.
+    model: CustomYOLO
+    x    : [B,4,H,W]
+    returns: YOLO detections just like yolo predict
     """
 
     model.eval()
 
-    # Detect.forward() returns DFL-decoded predictions in eval mode
-    raw = model(x)                     # shape: (B, 12, HW)
+    # Raw detect head output (already DFL-decoded in eval mode)
+    raw = model(x)                        # (B, 12, HW)
 
-    # convert to list of NMS outputs
+    # NMS expects (B, HW, 12)
+    raw = raw.permute(0, 2, 1)
+
     preds = non_max_suppression(
-        raw.permute(0, 2, 1),          # (B, HW, 12)
+        raw,
         conf_thres=conf,
         iou_thres=iou,
         max_det=max_det,
-        nc=model.nc                    # your number of classes
+        nc=model.nc     # number of classes
     )
 
-    # preds[i] has shape: (N, 6): [x1,y1,x2,y2,conf,class]
     return preds
 
 
 
+# ------------------------------------------------------
+#  VALIDATION LOOP (B2 Official decode)
+# ------------------------------------------------------
 @torch.no_grad()
 def validate_model(model, val_loader, device="cuda", conf=0.25, iou_thres=0.5):
+    
     model.eval()
+    device = torch.device(device)
+
     tp = fp = fn = 0
     correct_cls = 0
     total_cls = 0
 
     for imgs4, labels in tqdm(val_loader, desc="Validating"):
         imgs4 = imgs4.to(device)
-        H, W = imgs4.shape[2], imgs4.shape[3]
 
-        # 1. Get detect output
-        feats = model.forward_features(imgs4)
-        raw = model.detect(feats)
+        B, _, H, W = imgs4.shape
 
-        preds = yolov8_postprocess(raw, conf_threshold=conf)
+        # ------------------------------
+        # 1. Get YOLO official predictions
+        # ------------------------------
+        preds = yolo_official_postprocess(model, imgs4, conf=conf)
 
-        for i, det in enumerate(preds):
-            gt = labels[i].to(device)  # [N,5]
+        # ------------------------------
+        # 2. Loop over each image
+        # ------------------------------
+        for i in range(B):
 
+            det = preds[i]                # (N, 6)
+            gt  = labels[i].to(device)    # (G, 5)
+
+            # If no GT
             if gt.numel() == 0:
-                if det.size(0) > 0:
+                if det is not None and det.size(0) > 0:
                     fp += det.size(0)
                 continue
 
-            # Convert GT to pixel coords
+            # Convert GT normalized → pixel coords
             gx = gt[:,1] * W
             gy = gt[:,2] * H
             gw = gt[:,3] * W
             gh = gt[:,4] * H
 
-            x1 = gx - gw/2; y1 = gy - gh/2
-            x2 = gx + gw/2; y2 = gy + gh/2
-            gt_box = torch.stack([x1,y1,x2,y2], dim=1)
+            x1 = gx - gw/2;  y1 = gy - gh/2
+            x2 = gx + gw/2;  y2 = gy + gh/2
 
-            # Predictions
-            if det.size(0) == 0:
-                fn += gt.size(0)
+            gt_boxes = torch.stack([x1, y1, x2, y2], dim=1)
+            gt_cls   = gt[:,0].long()
+
+            # If no predictions
+            if det is None or det.size(0) == 0:
+                fn += gt_boxes.size(0)
                 continue
 
-            pred_box = det[:, :4]
-            pred_cls = det[:, 5].long()
+            pred_boxes = det[:, :4]
+            pred_cls   = det[:, 5].long()
 
-            # IoU matching
-            iou = box_iou(pred_box, gt_box)
-            max_iou, idx = iou.max(dim=1)
+            # ------------------------------
+            # 3. IoU matching
+            # ------------------------------
+            iou = box_iou(pred_boxes, gt_boxes)
+            max_iou, gt_idx = iou.max(dim=1)
 
-            match = max_iou > iou_thres
+            matched = max_iou > iou_thres
 
-            tp += match.sum().item()
-            fp += (~match).sum().item()
-            fn += gt.size(0) - match.sum().item()
+            tp += matched.sum().item()
+            fp += (~matched).sum().item()
+            fn += gt_boxes.size(0) - matched.sum().item()
 
-            # Class accuracy
-            matched_gt_cls = gt[idx][match][:,0].long()
-            matched_pred_cls = pred_cls[match]
+            # ------------------------------
+            # 4. Classification accuracy
+            # ------------------------------
+            matched_pred_cls = pred_cls[matched]
+            matched_gt_cls   = gt_cls[gt_idx[matched]]
 
             correct_cls += (matched_pred_cls == matched_gt_cls).sum().item()
-            total_cls += matched_pred_cls.numel()
+            total_cls   += matched_pred_cls.numel()
 
+    # ------------------------------
+    # FINAL METRICS
+    # ------------------------------
     map50 = tp / (tp + fp + 1e-6)
     cls_acc = correct_cls / (total_cls + 1e-6)
 
     return map50, cls_acc
-
