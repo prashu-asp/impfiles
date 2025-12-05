@@ -1,143 +1,85 @@
-import torch
-from tqdm import tqdm
-from ultralytics.utils.nms import non_max_suppression
+import torch.nn as nn
 
-
-# -----------------------------
-# IoU for validation
-# -----------------------------
-def box_iou(box1, box2):
+def rebuild_detect_head(self, nc: int = 8, reg_max: int = 16):
     """
-    box1: [N,4], box2:[M,4] in pixels
-    returns IoU matrix [N,M]
+    Rebuild the Detect head so it predicts `nc` classes while keeping DFL (reg_max) intact.
+
+    Call this after you have self.detect available (the original Detect module)
+    and before loading any custom weights that expect the rebuilt head.
+
+    This function:
+     - detects the per-scale input channels automatically
+     - rebuilds regression (cv2) outputs to reg_max*4 channels
+     - rebuilds class (cv3) outputs to nc channels
+     - preserves the dfl module (critical)
+     - sets detect attributes d.nc, d.reg_max, d.no correctly
     """
-    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    d = self.detect  # original Detect module from ultralytics
+    # 1) find channels for each detection scale robustly
+    if hasattr(d, "ch") and d.ch is not None:
+        channels = list(d.ch)  # common in many versions
+    else:
+        # fallback: extract from cv2 layer conv input channels
+        try:
+            channels = [m[0].conv.in_channels for m in d.cv2]
+        except Exception:
+            # another fallback for slightly different structures
+            channels = []
+            for m in d.cv2:
+                # try common spots
+                if hasattr(m[0], "conv") and hasattr(m[0].conv, "in_channels"):
+                    channels.append(m[0].conv.in_channels)
+                elif hasattr(m[0], "in_channels"):
+                    channels.append(m[0].in_channels)
+                else:
+                    raise RuntimeError("Cannot determine detect cv2 input channels. Inspect d.cv2 structure.")
+    # 2) configure core detect attributes
+    reg_out = reg_max * 4       # DFL bins * 4 sides (64 for reg_max=16)
+    d.nc = nc
+    d.reg_max = reg_max
+    d.no = reg_out + nc         # training-mode channel count that loss expects (e.g. 64 + 8 = 72)
 
-    lt = torch.max(box1[:, None, :2], box2[:, :2])  # top-left
-    rb = torch.min(box1[:, None, 2:], box2[:, 2:])  # bottom-right
+    # 3) Rebuild regression branches (cv2): output = reg_out
+    d.cv2 = nn.ModuleList([
+        nn.Sequential(
+            nn.Conv2d(c, c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(),
+            nn.Conv2d(c, c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(),
+            nn.Conv2d(c, reg_out, 1)
+        )
+        for c in channels
+    ])
 
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, :, 0] * wh[:, :, 1]
-    union = area1[:, None] + area2 - inter
+    # 4) Rebuild classification branches (cv3): output = nc
+    d.cv3 = nn.ModuleList([
+        nn.Sequential(
+            nn.Conv2d(c, c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(),
+            nn.Conv2d(c, c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(),
+            nn.Conv2d(c, nc, 1)
+        )
+        for c in channels
+    ])
 
-    return inter / union.clamp(min=1e-6)
+    # 5) Keep DFL layer untouched (d.dfl) — critical for decoding/training
+    if not hasattr(d, "dfl"):
+        # some ultralytics versions put DFL elsewhere – warn but continue
+        print("Warning: detect has no attribute dfl; ensure DFL exists or decoding may differ.")
 
+    # 6) Move rebuilt modules to same device as model
+    device = next(self.parameters()).device
+    d.to(device)
 
+    # 7) print verification
+    print("✔ Detect head rebuilt for", nc, "classes")
+    print("  cv2 outputs (reg channels):", [m[-1].out_channels for m in d.cv2])
+    print("  cv3 outputs (class channels):", [m[-1].out_channels for m in d.cv3])
+    print("  training-mode channel count d.no =", d.no, "(= reg_max*4 + nc)")
 
-# ------------------------------------------------------
-# OFFICIAL YOLOv8 POSTPROCESS (B2)
-# ------------------------------------------------------
-@torch.no_grad()
-def yolo_official_postprocess(model, x, conf=0.25, iou=0.45, max_det=300):
-    """
-    model: CustomYOLO
-    x    : [B,4,H,W]
-    returns: YOLO detections just like yolo predict
-    """
-
-    model.eval()
-
-    # Raw detect head output (already DFL-decoded in eval mode)
-    raw = model(x)                        # (B, 12, HW)
-
-    # NMS expects (B, HW, 12)
-    raw = raw.permute(0, 2, 1)
-
-    preds = non_max_suppression(
-        raw,
-        conf_thres=conf,
-        iou_thres=iou,
-        max_det=max_det,
-        nc=model.nc     # number of classes
-    )
-
-    return preds
-
-
-
-# ------------------------------------------------------
-#  VALIDATION LOOP (B2 Official decode)
-# ------------------------------------------------------
-@torch.no_grad()
-def validate_model(model, val_loader, device="cuda", conf=0.25, iou_thres=0.5):
-    
-    model.eval()
-    device = torch.device(device)
-
-    tp = fp = fn = 0
-    correct_cls = 0
-    total_cls = 0
-
-    for imgs4, labels in tqdm(val_loader, desc="Validating"):
-        imgs4 = imgs4.to(device)
-
-        B, _, H, W = imgs4.shape
-
-        # ------------------------------
-        # 1. Get YOLO official predictions
-        # ------------------------------
-        preds = yolo_official_postprocess(model, imgs4, conf=conf)
-
-        # ------------------------------
-        # 2. Loop over each image
-        # ------------------------------
-        for i in range(B):
-
-            det = preds[i]                # (N, 6)
-            gt  = labels[i].to(device)    # (G, 5)
-
-            # If no GT
-            if gt.numel() == 0:
-                if det is not None and det.size(0) > 0:
-                    fp += det.size(0)
-                continue
-
-            # Convert GT normalized → pixel coords
-            gx = gt[:,1] * W
-            gy = gt[:,2] * H
-            gw = gt[:,3] * W
-            gh = gt[:,4] * H
-
-            x1 = gx - gw/2;  y1 = gy - gh/2
-            x2 = gx + gw/2;  y2 = gy + gh/2
-
-            gt_boxes = torch.stack([x1, y1, x2, y2], dim=1)
-            gt_cls   = gt[:,0].long()
-
-            # If no predictions
-            if det is None or det.size(0) == 0:
-                fn += gt_boxes.size(0)
-                continue
-
-            pred_boxes = det[:, :4]
-            pred_cls   = det[:, 5].long()
-
-            # ------------------------------
-            # 3. IoU matching
-            # ------------------------------
-            iou = box_iou(pred_boxes, gt_boxes)
-            max_iou, gt_idx = iou.max(dim=1)
-
-            matched = max_iou > iou_thres
-
-            tp += matched.sum().item()
-            fp += (~matched).sum().item()
-            fn += gt_boxes.size(0) - matched.sum().item()
-
-            # ------------------------------
-            # 4. Classification accuracy
-            # ------------------------------
-            matched_pred_cls = pred_cls[matched]
-            matched_gt_cls   = gt_cls[gt_idx[matched]]
-
-            correct_cls += (matched_pred_cls == matched_gt_cls).sum().item()
-            total_cls   += matched_pred_cls.numel()
-
-    # ------------------------------
-    # FINAL METRICS
-    # ------------------------------
-    map50 = tp / (tp + fp + 1e-6)
-    cls_acc = correct_cls / (total_cls + 1e-6)
-
-    return map50, cls_acc
+    # Done (no return). After this, training-mode detect forward should produce (B, d.no, HW)
