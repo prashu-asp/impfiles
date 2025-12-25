@@ -1,85 +1,106 @@
-import torch.nn as nn
+# parameters
+nc: 1
+depth_multiple: 1.0
+width_multiple: 1.0
 
-def rebuild_detect_head(self, nc: int = 8, reg_max: int = 16):
-    """
-    Rebuild the Detect head so it predicts `nc` classes while keeping DFL (reg_max) intact.
+anchors:
+  - [10,13, 16,30, 33,23]
+  - [30,61, 62,45, 59,119]
+  - [116,90, 156,198, 373,326]
 
-    Call this after you have self.detect available (the original Detect module)
-    and before loading any custom weights that expect the rebuilt head.
+# =========================
+# Backbone
+# =========================
+backbone:
+[
+  # ---------- RGB STREAM ----------
+  [-1, 1, Focus, [64, 3]],          # 0  RGB P1/2
+  [-1, 1, Conv, [128, 3, 2]],       # 1  RGB P2/4
+  [-1, 3, C3, [128]],               # 2
+  [-1, 1, Conv, [256, 3, 2]],       # 3  RGB P3/8
+  [-1, 9, C3, [256]],               # 4  RGB P3/8
 
-    This function:
-     - detects the per-scale input channels automatically
-     - rebuilds regression (cv2) outputs to reg_max*4 channels
-     - rebuilds class (cv3) outputs to nc channels
-     - preserves the dfl module (critical)
-     - sets detect attributes d.nc, d.reg_max, d.no correctly
-    """
-    d = self.detect  # original Detect module from ultralytics
-    # 1) find channels for each detection scale robustly
-    if hasattr(d, "ch") and d.ch is not None:
-        channels = list(d.ch)  # common in many versions
-    else:
-        # fallback: extract from cv2 layer conv input channels
-        try:
-            channels = [m[0].conv.in_channels for m in d.cv2]
-        except Exception:
-            # another fallback for slightly different structures
-            channels = []
-            for m in d.cv2:
-                # try common spots
-                if hasattr(m[0], "conv") and hasattr(m[0].conv, "in_channels"):
-                    channels.append(m[0].conv.in_channels)
-                elif hasattr(m[0], "in_channels"):
-                    channels.append(m[0].in_channels)
-                else:
-                    raise RuntimeError("Cannot determine detect cv2 input channels. Inspect d.cv2 structure.")
-    # 2) configure core detect attributes
-    reg_out = reg_max * 4       # DFL bins * 4 sides (64 for reg_max=16)
-    d.nc = nc
-    d.reg_max = reg_max
-    d.no = reg_out + nc         # training-mode channel count that loss expects (e.g. 64 + 8 = 72)
+  # ---------- IR STREAM ----------
+  [-4, 1, Focus, [64, 3]],           # 5  IR  P1/2
+  [-1, 1, Conv, [128, 3, 2]],        # 6  IR  P2/4
+  [-1, 3, C3, [128]],                # 7
+  [-1, 1, Conv, [256, 3, 2]],        # 8  IR  P3/8
+  [-1, 9, C3, [256]],                # 9  IR  P3/8
 
-    # 3) Rebuild regression branches (cv2): output = reg_out
-    d.cv2 = nn.ModuleList([
-        nn.Sequential(
-            nn.Conv2d(c, c, 3, padding=1, bias=False),
-            nn.BatchNorm2d(c),
+  # ---------- FiLM at P3 ----------
+  [[4, 9], 1, FiLM, [256]],          # 10  FiLM(P3) → RGB only
+
+  # ---------- RGB CONTINUES ----------
+  [-1, 1, Conv, [512, 3, 2]],        # 11  RGB P4/16
+  [-1, 9, C3, [512]],                # 12  RGB P4/16
+
+  # ---------- IR CONTINUES ----------
+  [9, 1, Conv, [512, 3, 2]],         # 13  IR  P4/16
+  [-1, 9, C3, [512]],                # 14  IR  P4/16
+
+  # ---------- FiLM at P4 ----------
+  [[12, 14], 1, FiLM, [512]],        # 15  FiLM(P4)
+
+  # ---------- RGB CONTINUES ----------
+  [-1, 1, Conv, [1024, 3, 2]],       # 16  RGB P5/32
+  [-1, 1, SPP, [1024, [5, 9, 13]]],  # 17
+  [-1, 3, C3, [1024, False]],        # 18
+
+  # ---------- IR CONTINUES ----------
+  [14, 1, Conv, [1024, 3, 2]],       # 19  IR  P5/32
+  [-1, 1, SPP, [1024, [5, 9, 13]]],  # 20
+  [-1, 3, C3, [1024, False]],        # 21
+
+  # ---------- FiLM at P5 ----------
+  [[18, 21], 1, FiLM, [1024]],       # 22  FiLM(P5)
+
+]
+
+# =========================
+# Head (STANDARD YOLO)
+# =========================
+head:
+[
+  [-1, 1, Conv, [512, 1, 1]],        # 23
+  [-1, 1, nn.Upsample, [None, 2, "nearest"]],
+  [[-1, 15], 1, Concat, [1]],        # 24  concat P4
+  [-1, 3, C3, [512, False]],         # 25
+
+  [-1, 1, Conv, [256, 1, 1]],        # 26
+  [-1, 1, nn.Upsample, [None, 2, "nearest"]],
+  [[-1, 10], 1, Concat, [1]],        # 27  concat P3
+  [-1, 3, C3, [256, False]],         # 28  P3
+
+  [-1, 1, Conv, [256, 3, 2]],
+  [[-1, 26], 1, Concat, [1]],
+  [-1, 3, C3, [512, False]],         # 29  P4
+
+  [-1, 1, Conv, [512, 3, 2]],
+  [[-1, 23], 1, Concat, [1]],
+  [-1, 3, C3, [1024, False]],        # 30  P5
+
+  [[28, 29, 30], 1, Detect, [nc, anchors]]
+]
+
+
+
+
+
+
+class FiLM(nn.Module):
+    def __init__(self, c, r=4):
+        super().__init__()
+        hidden = c // r
+
+        self.net = nn.Sequential(
+            nn.Conv2d(c, hidden, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden),
             nn.SiLU(),
-            nn.Conv2d(c, c, 3, padding=1, bias=False),
-            nn.BatchNorm2d(c),
-            nn.SiLU(),
-            nn.Conv2d(c, reg_out, 1)
+            nn.Conv2d(hidden, 2 * c, kernel_size=1, bias=True)
         )
-        for c in channels
-    ])
 
-    # 4) Rebuild classification branches (cv3): output = nc
-    d.cv3 = nn.ModuleList([
-        nn.Sequential(
-            nn.Conv2d(c, c, 3, padding=1, bias=False),
-            nn.BatchNorm2d(c),
-            nn.SiLU(),
-            nn.Conv2d(c, c, 3, padding=1, bias=False),
-            nn.BatchNorm2d(c),
-            nn.SiLU(),
-            nn.Conv2d(c, nc, 1)
-        )
-        for c in channels
-    ])
-
-    # 5) Keep DFL layer untouched (d.dfl) — critical for decoding/training
-    if not hasattr(d, "dfl"):
-        # some ultralytics versions put DFL elsewhere – warn but continue
-        print("Warning: detect has no attribute dfl; ensure DFL exists or decoding may differ.")
-
-    # 6) Move rebuilt modules to same device as model
-    device = next(self.parameters()).device
-    d.to(device)
-
-    # 7) print verification
-    print("✔ Detect head rebuilt for", nc, "classes")
-    print("  cv2 outputs (reg channels):", [m[-1].out_channels for m in d.cv2])
-    print("  cv3 outputs (class channels):", [m[-1].out_channels for m in d.cv3])
-    print("  training-mode channel count d.no =", d.no, "(= reg_max*4 + nc)")
-
-    # Done (no return). After this, training-mode detect forward should produce (B, d.no, HW)
+    def forward(self, x):
+        rgb, ir = x
+        gamma_beta = self.net(ir)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        return rgb * (1 + gamma) + beta
