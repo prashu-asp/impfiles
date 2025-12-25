@@ -101,6 +101,20 @@ class FiLM(nn.Module):
 
     def forward(self, x):
         rgb, ir = x
+      
+        print("FiLM DEBUG")
+        print("RGB shape:", rgb.shape if rgb is not None else None)
+        print("IR  shape:", ir.shape if ir is not None else None)
+      
         gamma_beta = self.net(ir)
         gamma, beta = gamma_beta.chunk(2, dim=1)
+      
+        print("gamma shape:", gamma.shape)
+      
         return rgb * (1 + gamma) + beta
+
+
+
+x = m(x)
+print(f"Layer {m.i:2d} | {m.type:20s} | shape: {x.shape if torch.is_tensor(x) else 'tuple'}")
+y.append(x if m.i in self.save else None)
