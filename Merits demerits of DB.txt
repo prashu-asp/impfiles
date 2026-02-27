@@ -1,0 +1,169 @@
+Merits demerits of only text , only image , image+text
+
+Reranking strategies
+
+Evaluation data
+
+==============================================================================
+Ok , after reading oyur answer I am categorising them into three categories,
+
+1. Extract RAW OCR text :
+
+search criteria : embedding similarity
+
+2. A sentence of visual descrpition of the package : ( A yellow coloured can shaped drink bottle .....)
+
+search criteria : embedding similarty.
+
+3. Ask gemini to give 4 labels :
+
+L1  : brad category fo the product
+L2 : Sub categry
+L3: Brnad + product
+L4 : Brand+product+some other extra details
+
+
+Search criteria : Lexical Matching 
+
+
+
+Merits and Demerits : 
+
+1. RAW OCR Text :
+
+Merits : 
+
+*If OCR correctly captures: brand + product + variant -> embedding similarity becomes extremely discriminative.
+
+*Embeddings Handle Minor OCR Noise ; "noodls masal"
+
+*Captures Variant-Level Differences   (strawberry milk , chcolate milk etc)
+
+Demerits : 
+
+* OCR ineffective due to low quality image r tilted image ; Incomplete OCR can cause
+
+map product to same brand but different product  or same product but different brand
+
+* Text is in some style font instead of normal font -> OCR fails
+
+
+
+2. VISUAL attributes DESCRIPTION SENTENCE 
+
+Merits : 
+
+Robust to slight motion blur and less quality images where complete text is not readable 
+
+Demerits : 
+
+Will have lot of false positives when specific brand is not identified ; it may to some other brand which has similar description
+
+
+3. Structured Labels : 
+
+L1: Brand category
+L2: Subcategory
+L3: Brand + product
+L4: Brand + product + extra details
+
+
+
+Merits : 
+
+search space willbe resduced and L3 based filtering can reduce False positives
+
+No need of extra embedding model
+
+Demerits :
+
+Brand should be correctly identified other wise it can map to someother brand
+
+
+
+Only Text embedding : 
+===================
+
+Merits : 
+
+Precision will be high ompared to only image mebdding
+
+if image and text especially brand + product in it is clear , precision and hitrate both will be high
+
+*latency will be very less
+
+Demerits : 
+
+-> Motion blur , partia visbility , glare decreases erformance: Text Clarity should be high ; If brand text is not able to extract then will be mapped to some other brand . Beacsue in most cases brand will be small logo and text will be inside it 
+
+
+-> Rotated , tilted images will not give good text output from gemini
+
+
+-> Text should be normal foont , different font can face text extraction issues
+
+-> Hand can lock text
+
+
+
+Only image embeddings : 
+====================
+
+Merits: 
+
+-> Most of the times , L1,L2 will be correct
+
+-> Image quality dont need to be as good as it required for text embedding
+
+Demerits : 
+
+
+Same brand different products some times have similar packaging 
+
+1CAM images and high quality images combination is giving less numbers compared to 1 cam 1 cam 
+
+-> Segmentation helps , but it increases latecy
+
+-> Latency will be high compared to only text
+
+->  Hand Occlusion Interference
+
+-> Different brand same procduct will have similar packaging like having bowl and recipe in it and brand logo will be very small; Precision will be less 
+
+
+
+
+Image + Text Embeddings : 
+-----------------------
+
+Good reranking strategy is needed
+
+Merits :
+
+Precision will be very high even with lower threshold ; 
+
+When one signal fails, the other compensates.
+
+dEMERITS :
+
+-> high latency and cost
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
