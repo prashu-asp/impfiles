@@ -1,0 +1,278 @@
+# Gemma 3 Open Model Tuning Using Google Cloud Agent Platform
+
+## 1. Overview
+
+Google Cloud Agent Platform provides a managed workflow for fine-tuning open models without requiring users to manage GPUs, TPUs, clusters, or distributed training infrastructure.
+
+The platform is designed for:
+
+* Multimodal model customization
+* Agent applications
+* Enterprise AI assistants
+* Domain adaptation
+* Production deployment
+
+Google manages:
+
+* Training infrastructure
+* Resource provisioning
+* Checkpoint management
+* Job execution
+* Deployment integration
+
+Users primarily provide:
+
+* Dataset
+* Base model
+* Hyperparameters
+
+This approach significantly reduces operational complexity compared to Vertex AI Training Clusters (VTC).
+
+---
+
+## 2. Supported Gemma Models
+
+At the time of writing, the Open Model Tuning documentation lists the following Gemma model as supported:
+
+| Model          | Tuning Modes                  | Modalities |
+| -------------- | ----------------------------- | ---------- |
+| Gemma 3 27B IT | LoRA (PEFT), Full Fine-Tuning | Text       |
+
+The documentation also supports several Llama and Qwen models through the same tuning workflow.
+
+> Note: Gemma 4 models exist, but the current Open Model Tuning documentation specifically lists Gemma 3 27B IT as the supported Gemma tuning model.
+
+---
+
+## 3. End-to-End Workflow
+
+```text
+Multimodal Dataset
+↓
+Google Cloud Storage
+↓
+Agent Platform Tuning Job
+↓
+Gemma 3 Base Model
+↓
+Managed Fine-Tuning
+↓
+Tuned Model
+↓
+Deployment
+↓
+Agent Application
+```
+
+Workflow:
+
+1. Upload dataset to Cloud Storage.
+2. Create a tuning job.
+3. Select Gemma 3 27B IT.
+4. Configure tuning parameters.
+5. Google executes the tuning job.
+6. A tuned model artifact is created.
+7. Deploy the tuned model.
+8. Use the model inside applications or agents.
+
+---
+
+## 4. Multimodal Dataset Preparation
+
+The most important component of successful tuning is dataset quality.
+
+Example multimodal dataset:
+
+```json
+{
+  "image": "gs://bucket/mango.jpg",
+  "question": "Identify the fruit",
+  "answer": "Mango"
+}
+```
+
+Typical use cases:
+
+* Fruit and vegetable classification
+* OCR
+* Document understanding
+* Visual question answering
+* Product recognition
+* Chart understanding
+
+Important considerations:
+
+* Accurate labels
+* Consistent formatting
+* Representative production examples
+* Coverage of edge cases
+
+For multimodal models, image quality and annotation quality generally have a larger impact than increasing training epochs.
+
+---
+
+## 5. Fine-Tuning Strategy
+
+Supported tuning modes:
+
+### LoRA (Parameter-Efficient Fine-Tuning)
+
+```text
+Gemma Base Model
+↓
+Freeze Most Weights
+↓
+Train Small Adapters
+↓
+Tuned Model
+```
+
+Benefits:
+
+* Lower cost
+* Faster training
+* Smaller checkpoints
+
+### Full Fine-Tuning
+
+```text
+Gemma Base Model
+↓
+Train All Parameters
+↓
+Tuned Model
+```
+
+Benefits:
+
+* Maximum flexibility
+* Better adaptation potential
+
+Tradeoffs:
+
+* Higher compute cost
+* Larger memory requirements
+* Longer training times
+
+For most practical use cases, LoRA is the recommended starting point.
+
+---
+
+## 6. Deployment
+
+After tuning:
+
+```text
+Client
+↓
+Agent Platform Endpoint
+↓
+Tuned Gemma Model
+↓
+Response
+```
+
+Features:
+
+* Managed endpoints
+* Autoscaling
+* Monitoring
+* Logging
+* IAM integration
+
+The tuned model can be directly integrated into agent applications and enterprise workflows.
+
+---
+
+## 7. Cost Components
+
+### A. Training Cost
+
+Training costs depend on:
+
+* Dataset size
+* Number of epochs
+* Model size
+* Tuning mode (LoRA vs Full FT)
+
+Google charges for the underlying training resources used by the tuning job. Open model tuning uses managed infrastructure rather than token-based Gemini tuning pricing.
+
+Typical guidance:
+
+| Workload                 | Estimated Cost |
+| ------------------------ | -------------- |
+| Small LoRA experiment    | $20–100        |
+| Medium tuning project    | $100–500       |
+| Large Gemma 3 tuning job | $500–2000+     |
+
+Actual costs depend heavily on dataset size and training duration.
+
+---
+
+### B. Deployment Cost
+
+After deployment, the endpoint remains active and incurs infrastructure costs.
+
+Cost drivers:
+
+* Number of replicas
+* Accelerator type
+* Endpoint uptime
+* Autoscaling configuration
+
+Typical monthly ranges:
+
+| Deployment Size                 | Estimated Monthly Cost |
+| ------------------------------- | ---------------------- |
+| Development endpoint            | $100–500               |
+| Small production workload       | $500–2000              |
+| High-volume production workload | $2000–10000+           |
+
+Deployed endpoints continue incurring charges even when idle unless they are undeployed.
+
+---
+
+### C. Prediction Cost
+
+Prediction costs depend on:
+
+* Number of requests
+* Input tokens
+* Output tokens
+* Endpoint resources
+
+Cost drivers:
+
+```text
+Requests
++
+Input Tokens
++
+Output Tokens
+```
+
+For many production systems:
+
+```text
+Prediction Cost
+>
+Training Cost
+```
+
+over the lifetime of the application because inference runs continuously while training is typically performed only once.
+
+---
+
+## Summary
+
+Google Cloud Agent Platform Open Model Tuning provides a managed approach for customizing Gemma models without managing training infrastructure.
+
+Key characteristics:
+
+* Managed tuning workflow
+* Focus on dataset quality
+* LoRA and Full Fine-Tuning support
+* Integrated deployment
+* Production-ready serving infrastructure
+
+This approach is best suited for teams that want to build multimodal AI applications and agents while avoiding the operational complexity of distributed training systems.
