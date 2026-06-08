@@ -1,0 +1,635 @@
+Google Vertex AI tackles managed tuning with a very specific philosophy: **you provide the dataset and configuration via code, and Google treats the training loop like a closed-box orchestration pipeline**. You don't manage SSH keys, configure Hugging Face Accelerate, or run driver installations.
+For open-weight models like the Gemma family, Vertex AI offers this via **Model Garden Managed Tuning Pipelines**.
+## The Workflow Architecture
+When you trigger a managed fine-tuning job on Vertex AI for Gemma, Google orchestrates the following automated pipeline:
+```
+[ GCS Bucket: data.jsonl ] ──> [ Vertex AI SFT Pipeline ] ──> [ Auto-allocated TPUs / GPUs ]
+                                                                     │ (Trains Model & LoRA Adapters)
+[ Vertex AI Endpoint ]    <── [ Vertex Model Registry ]   <── [ GCS Bucket: Saved Weights ]
+
+```
+ 1. **Storage Isolation:** You store your data safely in your own Google Cloud Storage (GCS) bucket.
+ 2. **Compute Provisioning:** Vertex AI provisions a fleeting cluster of optimized accelerators (typically Google TPUs or NVIDIA L4/H100 GPUs depending on the model scale) dedicated entirely to your job.
+ 3. **Execution & Metric Tracking:** It runs the Supervised Fine-Tuning (SFT) loop, automatically hooking up to Vertex AI TensorBoard if you want to watch loss curves drop in real time.
+ 4. **Teardown & Register:** Once training is done, the compute cluster is destroyed instantly (you stop paying for hardware immediately). The fine-tuned weights/adapters are dumped into your GCS bucket and registered as an asset in the **Vertex AI Model Registry**.
+## Technical Setup: Step-by-Step
+### 1. Data Preparation (The JSONL Format)
+Vertex AI expects your training data in a single or multi-line .jsonl file. For an instruction-tuned model like Gemma, you must format your rows to mimic a conversation structure:
+```json
+{"contents": [{"role": "user", "parts": [{"text": "Analyze this error: NullPointerException at line 42."}]}, {"role": "model", "parts": [{"text": "This occurs because the object reference at line 42 was initialized to null before a method call."}]}]}
+{"contents": [{"role": "user", "parts": [{"text": "How do I clear the cache?"}]}, {"role": "model", "parts": [{"text": "Run 'systemctl restart cache-service' from your terminal root."}]}]}
+
+```
+Upload this file to a GCS bucket (e.g., gs://your-unique-bucket/tuning-data/train.jsonl).
+### 2. The Python Implementation
+You trigger the training using the vertexai Python SDK via the Supervised Fine Tuning (sft) module.
+```python
+import time
+import vertexai
+from vertexai.tuning import sft, SourceModel
+
+# Initialize Vertex AI with your GCP project details
+PROJECT_ID = "your-gcp-project-id"
+REGION = "us-central1" # Or us-east4 / europe-west4 based on hardware availability
+vertexai.init(project=PROJECT_ID, location=REGION)
+
+# Trigger the managed fine-tuning pipeline
+tuning_job = sft.train(
+    # Point directly to the Gemma model identifier in Model Garden
+    source_model=SourceModel(
+        base_model="google/gemma3@gemma-3-27b-it" 
+    ),
+    # PEFT_ADAPTER tells Vertex to use LoRA (Parameter-Efficient Fine-Tuning)
+    tuning_mode="PEFT_ADAPTER", 
+    epochs=3,
+    learning_rate_multiplier=1.0,
+    
+    # Define where data comes from and where the output adapters land
+    train_dataset="gs://your-unique-bucket/tuning-data/train.jsonl",
+    validation_dataset="gs://your-unique-bucket/tuning-data/validation.jsonl",
+    output_uri="gs://your-unique-bucket/tuned-gemma-artifacts/"
+)
+
+# Optional: Monitor the job synchronously via polling
+print(f"Tuning job started: {tuning_job.resource_name}")
+while not tuning_job.has_ended:
+    time.sleep(60)
+    tuning_job.refresh()
+    print("Training in progress...")
+
+print("Tuning complete!")
+print(f"Tuned Model Registry Name: {tuning_job.tuned_model_name}")
+
+```
+## Deploying Your Fine-Tuned Gemma Model
+Once the tuning job reaches a successful status, the model doesn't just sit in storage; it is tied directly to Vertex AI’s deployment pipeline. You have two options for serving your newly tuned model:
+### Option A: Fully Managed Vertex Endpoint (Recommended)
+You can deploy the output directly from the Model Registry onto a serving endpoint using optimized inference frameworks like vLLM.
+```python
+from vertexai.preview import model_garden
+
+# Wrap the fine-tuned model checkpoint
+custom_model = model_garden.CustomModel(tuning_job.tuned_model_name)
+
+# Deploy to a managed GPU-backed endpoint with 1 click
+endpoint = custom_model.deploy(
+    machine_type="g2-standard-12", # Automatically handles instance provisioning
+    accelerator_type="NVIDIA_L4",
+    accelerator_count=1,
+    accept_eula=True
+)
+
+# Test it immediately
+response = endpoint.predict(instances=[{"prompt": "Analyze this error..."}])
+print(response)
+
+```
+### Option B: Local / Hybrid Extraction
+Because it's a completely open architecture, the output_uri directory inside your GCS bucket contains standard LoRA adapter weights (safetensors or bin files). You can download those files locally at any time and merge them into a standard Hugging Face Transformers pipeline or run them on consumer hardware via llama.cpp.
+## Why Choose the Vertex AI Path?
+ * **VPC and Enterprise Data Security:** Your training data never leaves your Google Cloud boundary. If your company enforces strict data governance, Vertex AI honors your existing IAM (Identity and Access Management) privileges and VPC perimeters.
+ * **Guaranteed Compute Allocation:** When you run a regular VM instance on a standard cloud provider, you often hit a "GPU Out of Stock" capacity wall. Vertex AI’s underlying managed engine has specialized capacity queues for batch jobs, lessening the resource crunch.
+ * **Predictable Billing:** You pay for the duration of the pipeline execution rather than leaving an expensive instance running idle overnight because you forgot to turn it off.
+
+Fine-tuning an open-weights model like **Gemma 4** (such as the 26B A4B or 31B variants) on Google Vertex AI avoids the complexities of bare-metal GPU management, but it introduces a distinct, multi-layered cost model.
+On Vertex AI, you do not pay "per token" for fine-tuning open models like you would for proprietary models (like Gemini). Instead, you are billed for the **exact infrastructure duration** required to execute the managed training pipeline, plus any ongoing hosting fees.
+The complete cost breakdown to plan, budget, and run a Gemma 4 fine-tuning job on Vertex AI involves several key components.
+### 1. Main Cost: Managed Pipeline Compute Fees
+Vertex AI calculates fine-tuning using **Custom Training Resource Pricing**. When executing a managed pipeline, Google provisions the underlying hardware, handles the training job, and tacks on a **Vertex AI Management Premium Fee** on top of standard Google Compute Engine (GCE) hardware rates.
+Depending on whether you choose NVIDIA GPUs or Google’s custom-built TPUs, the per-hour costs scale as follows:
+| Hardware Accelerator Type | Base Hardware Rate (approx. /hr) | Total with Vertex AI Premium Fee (per instance/hr) |
+|---|---|---|
+| **NVIDIA A100 (40GB)** | ~$2.93 | **~$3.37** |
+| **NVIDIA H100 (80GB)** | ~$10.00 – $11.00 | **~$11.00 – $12.00** |
+| **NVIDIA A3 Cluster (8x H100)** | — | **~$101.00** |
+| **Google TPU v5e** | Custom Batch Rate | *Varies by dynamic availability* |
+#### Estimating a Gemma 4 Fine-Tuning Job:
+Assuming you are utilizing a Parameter-Efficient fine-tuning strategy like **LoRA/QLoRA** on a dataset of **50,000 instructions (~20-30 million tokens)** for 3 epochs:
+ * **Gemma 4 (26B A4B or 31B):** Typically requires a node cluster with multiple high-VRAM cards (e.g., an a2-highgpu-8g node containing 8x A100s, costing roughly **$35.40/hour** total).
+ * **Duration:** A highly optimized managed pipeline will take roughly **3 to 6 hours** to complete the training loop.
+ * **Estimated Cost Base:** $35.40/hr × 4.5 hours = **~$160.00** total for the compute run.
+### 2. Hidden Cost: Vertex AI TensorBoard (Monitoring)
+If you want to view real-time loss curves, learning rates, and training performance, Vertex AI automatically mounts your pipeline to a managed TensorBoard instance.
+ * **Pricing:** Vertex AI charges **$25.00 per active user per month** for the TensorBoard compute resource, plus minimal data storage fees.
+ * *Cost Mitigation:* If you do not actively assign or open a TensorBoard instance to the training job container via your code configuration, you can bypass this charge.
+### 3. Storage Costs (Google Cloud Storage)
+Before training begins, you must store your dataset in a GCS bucket, and when training finishes, Vertex AI dumps the output LoRA adapter weights (.safetensors) or full-model shards back into your bucket.
+ * **Dataset Storage:** JSONL datasets are highly compact. Even a large 100MB dataset costs fractions of a cent.
+ * **Model Artifacts Storage:** A fully tuned model or large adapter folder takes up roughly 10GB to 60GB.
+ * **Pricing:** Google Cloud Storage standard tier costs **~$0.02 to $0.026 per GB per month**.
+ * **Total Storage Impact:** Storing a 50GB model output runs **~$1.30 per month**.
+### 4. Downstream Cost: Model Inference & Deployment
+Once training finishes, your compute charges drop to zero instantly. However, the next step—making your model useful—creates an ongoing expense. If you deploy your tuned Gemma 4 weights to a **Vertex AI Prediction Endpoint**, you enter continuous billing.
+ * **The Trap:** Vertex AI inference endpoints **do not scale to zero** by default. If you leave a dedicated GPU running an endpoint to await live requests, you pay for it 24/7.
+ * **Cost Blueprint:**
+   * To serve a Gemma 4 (26B/31B) model effectively with low latency, you will likely deploy to an a2-highgpu-1g node (1x A100 40GB) or a newer g2 instance with optimized NVIDIA L4 GPUs.
+   * A single A100 endpoint left running continuously costs roughly **~$2.93 to $3.37 per hour**, which accumulates to **~$2,100 to $2,400+ per month**.
+### Financial Strategy Summary
+| Phase | Resource Needed | Pricing Model | Estimated Cost |
+|---|---|---|---|
+| **Data & Artifacts** | GCS Storage (~60GB) | Pay-per-GB/month | **~$1.50 / month** |
+| **Fine-Tuning Run** | 1x a2-highgpu-8g (8x A100s) | Pay-per-second of run | **~$100 to $250 flat fee** (depends on dataset volume) |
+| **Serving (Managed)** | Continuous GPU Endpoint | Hourly flat-rate | **~$2,100+ / month** (if kept alive 24/7) |
+### How to Keep Vertex AI Costs Low
+ 1. **Download the Artifacts:** Since Gemma 4 is an open architecture, you don't *have* to host it on a costly continuous Vertex Endpoint. Once the managed tuning pipeline saves the weights to your GCS bucket, you can download them and serve them locally or run them via cheaper, serverless alternatives (like batch predictions or scale-to-zero container platforms).
+ 2. **Utilize LoRA (PEFT_ADAPTER):** Ensure your tuning script sets tuning_mode="PEFT_ADAPTER". Full parameter tuning requires drastically larger GPU clusters (like A3 infrastructure) and can easily increase your training budget by 5x to 10x.
+
+Hosting a model in **Vertex AI Model Garden** splits into two completely different billing tracks depending on the *type* of model you choose:
+ 1. **First-Party Foundation Models (API-based, pay-per-token)**: This includes Google's proprietary models like Gemini 2.5/3 or Imagen.
+ 2. **Open-Weights Models (Infrastructure-based, pay-per-hour)**: This includes third-party open models like **Gemma**, Llama, or Mistral.
+The exact framework for how pricing functions across these two paths helps clear up potential billing surprises.
+### Track 1: First-Party / Partner Foundation Models (Pay-as-You-Go API)
+If you are using Google's native foundation models directly via the Model Garden API, **you pay absolutely nothing for hosting or deployment.** Google manages the underlying servers entirely. Instead, you are billed purely for the data volume processed through the endpoint (measured per 1 million tokens).
+| Model | Input Price (per 1M Tokens) | Output Price (per 1M Tokens) | Context Caching (per 1M Tokens/hr) |
+|---|---|---|---|
+| **Gemini 3.1 Flash-Lite** | $0.25 | $1.50 | — |
+| **Gemini 3 Flash** | $0.50 | $3.00 | $0.045 |
+| **Gemini 2.5 Pro** (\le 200k context) | $1.25 | $10.00 | $0.075 |
+| **Gemini 2.5 Pro** (> 200k context) | $2.50 | $15.00 | $0.075 |
+ * **The Catch:** If you add specialized add-ons like *Grounding with Google Search*, an additional flat rate of **$14.00 per 1,000 search queries** applies.
+### Track 2: Open-Weights Models (Infrastructure-Based Hosting)
+When deploying open models from the Model Garden (like **Gemma 4**, Llama 3, or Mistral) onto a live endpoint, the token-pricing table is thrown out. Instead, you enter **Vertex AI Online Prediction Pricing**, where you pay for dedicated virtual machines and accelerators running 24/7.
+Your hosting cost is the sum of: **[Machine Type Price/hr] + [Accelerator/GPU Price/hr]**.
+#### Common Compute Engine Instances (Prediction Rates)
+ * **n1-standard-4** (4 vCPUs, 15GB RAM): **$0.218 / hour**
+ * **n1-highmem-8** (8 vCPUs, 52GB RAM): **$0.544 / hour**
+#### Core Dedicated GPU / Accelerator Hosting Rates
+Because large language models require extensive video memory (VRAM), you must attach dedicated hardware to your machine:
+| Accelerator / GPU Type | Price Per Hour (per single unit) | Monthly Cost (If left running 24/7) |
+|---|---|---|
+| **NVIDIA L4** (24GB VRAM) | ~$0.50 – $0.60 | **~$360 – $430** |
+| **NVIDIA A100** (40GB VRAM) | **$3.37** | **~$2,426** |
+| **NVIDIA H100** (80GB VRAM) | **$11.76** | **~$8,467** |
+| **TPU v3 Pod (32 Cores)** | **$38.40** | **~$27,648** |
+#### Real-World Blueprint: Hosting a Gemma 4 (26B/31B Parameters)
+To serve a 26B or 31B model with optimized serving frameworks like vLLM, a single L4 GPU will not have enough VRAM. You generally require either a cluster of **4x L4 GPUs** or a dedicated **1x A100 (40GB/80GB)** instance to maintain production-level inference speeds.
+ * **Using 1x A100 Host Engine:** You are looking at a predictable operational expense of **~$2,426 per month per endpoint node**.
+### Crucial Hidden Architecture Fees & Platform Rules
+#### 1. No Auto-Scale to Zero (The "Idle Trap")
+Vertex AI online endpoints do not scale down to 0 instances when traffic stops. Even if your endpoint receives zero API calls over the weekend, Google keeps the assigned GPU running in the data center. An idle A100 endpoint will still run you roughly $80/day unless you explicitly delete or pause the deployment.
+#### 2. Model Registry & Storage Fees
+The actual compiled model files must sit somewhere before being read by the endpoint.
+ * **Cost:** Vertex AI leverages Google Cloud Storage (GCS) and Vertex Model Registry. Standard data storage runs roughly **$0.02 per GB per month**.
+ * **Impact:** For a 50GB model footprint, this runs a negligible **$1.00/month**.
+#### 3. Scaling Replicas Multiplier
+If your application traffic spikes and your single instance hits maximum throughput, Vertex AI’s auto-scaler will duplicate the entire stack to handle the request volume. If you scale from 1 node to 3 nodes during peak hours, your hosting cost instantly triples to **~$10.11/hour** for that window.
+### Cost Mitigation Strategy
+If you are running open-source models for intermittent or non-continuous workflows (like internal analysis, report generation, or developer testing), look into **Vertex AI Batch Prediction** rather than a live Endpoint. Batch predictions spin up the GPU infrastructure, run through a massive stack of data rows in a single batch file, and then immediately shut the hardware down, billing you strictly for the exact processing seconds.
+
+Hosting Google's **Gemma 4 26B** (specifically the *26B A4B* Mixture-of-Experts variant) on Vertex AI is fundamentally different from using a proprietary model like Gemini. Because it is an open-weights model, you aren't paying a generic price per token for hosting; instead, **you are renting dedicated cloud hardware** to run the model 24/7.
+The cost landscape is divided into two parts: the infrastructure you need to handle this specific architecture, and a much cheaper managed option if you don't actually need the model online round-the-clock.
+### Hardware Reality: What does Gemma 4 26B require?
+The "A4B" in Gemma 4 26B stands for **Active 4 Billion** parameters. Even though it acts like a massive model, its Mixture-of-Experts (MoE) architecture means only about 3.8B parameters activate *per token*.
+However, to host the model, **the entire 25.2B total parameter footprint must be loaded into GPU memory (VRAM)**.
+ * Unquantized (16-bit), the model weights consume roughly **50GB to 55GB of VRAM** just to sit in memory, before adding overhead for context processing.
+ * Quantized (e.g., using FP4/INT4 optimizations via vLLM), you can squeeze the footprint down to roughly **16GB to 20GB of VRAM**.
+### Track 1: Live, Continuous Hosting (Online Prediction Endpoints)
+If your application needs immediate, real-time responses via an API, you must deploy the model to a Vertex AI Online Prediction Endpoint. Google bills you based on the host virtual machine + the attached accelerators.
+#### Option A: Optimized Quantized Setup (Highly Recommended)
+By using NVIDIA's FP4 optimization or basic AWQ quantization inside a vLLM serving container, the model fits cleanly on a single, cost-effective GPU node.
+ * **Hardware:** g2-standard-12 machine type + **1x NVIDIA L4 (24GB VRAM)**.
+ * **Hourly Cost:** ~$0.55 / hour (includes the hardware rate + Vertex AI management fee).
+ * **Monthly Cost:** **~$400 per month.**
+ * **Trade-off:** Minimal impact on model quality, but unlocks massive cost savings.
+#### Option B: Full Precision (BF16) Setup
+If you refuse to quantize and want the absolute maximum raw precision out of the model weights, a single L4 card won't cut it. You will need a premium, high-VRAM card.
+ * **Hardware:** a2-highgpu-1g machine type + **1x NVIDIA A100 (40GB/80GB VRAM)**.
+ * **Hourly Cost:** ~$3.37 / hour.
+ * **Monthly Cost:** **~$2,426 per month.**
+ * **Trade-off:** High performance, but an exponential jump in pricing.
+> ⚠️ **The Vertex AI Idle Trap:** Vertex AI endpoints **do not auto-scale to zero**. If your application receives zero traffic over a weekend, that GPU stays powered on in Google's data center, and you are billed continuously.
+> 
+### Track 2: The "Zero-Infrastructure" Alternative (Serverless / Batch)
+If you do not want to manage these underlying server costs, you have two alternative routes to bypass the 24/7 hosting bills.
+#### 1. Vertex AI Model Garden Serverless Endpoints (If available)
+Google occasionally opens shared-infrastructure, pay-per-token API routes for popular open models like Gemma. For Gemma 4 26B, serverless proxy rates sit roughly at:
+ * **Input Price:** ~$0.06 per 1 million tokens
+ * **Output Price:** ~$0.33 per 1 million tokens
+ * **Best For:** Low or highly irregular traffic where paying $400+/month flat-rate makes no financial sense.
+#### 2. Vertex AI Batch Prediction
+If you are processing data asynchronously (e.g., analyzing 10,000 documents overnight), you can submit a **Batch Prediction Job**.
+ * **How it works:** Vertex AI automatically spins up the necessary GPU infrastructure, rapidly processes your data stack, writes the results to a Cloud Storage bucket, and **instantly destroys the compute nodes**.
+ * **Cost:** You only pay for the exact node-hours it took to process the dataset (often costing just a few dollars per run).
+### Financial Blueprint: Summary Breakdown
+| Hosting Strategy | Hardware Config | Monthly Cost Projection | Target Workload |
+|---|---|---|---|
+| **Quantized Live** | 1x NVIDIA L4 (24GB) | **~$400 / month** | Standard production apps with steady traffic. |
+| **Full Precision Live** | 1x NVIDIA A100 (40GB+) | **~$2,426 / month** | High-throughput, enterprise systems requiring zero optimization latency loss. |
+| **Batch Pipeline** | Automated Cluster | **Pay-per-minute** (\approx $2–$5 per run) | Back-end data processing, evaluations, or daily scheduled transformations. |
+**Next Step Recommendation:** If you are building a consumer-facing app, look into deploying the **FP4/INT4 quantized version on a single NVIDIA L4 card** using Vertex AI's integrated vLLM framework. It keeps your operational baseline under $500/month while utilizing the high performance of Gemma 4's MoE architecture.
+
+When scaling open-weights models like **Gemma 4 26B** (a Mixture-of-Experts model) using modern serving runtimes (such as vLLM or TensorRT-LLM) inside a Vertex AI shard/node, **QPS (Queries Per Second) is not a fixed number**.
+Unlike a traditional web server database where 1 instance = 500 QPS, an LLM’s QPS is determined by three variables:
+ 1. **Input Prompt Length:** (How much context the GPU has to read at first).
+ 2. **Output Token Length:** (How many tokens the model has to generate sequentially).
+ 3. **The Target Latency Boundary:** (How long you are willing to let the user wait for their first token).
+Evaluating what a single hardware shard running Gemma 4 26B can realistically handle highlights how scaling operates.
+### The Baseline Numbers: QPS per Shard
+Assuming a standard production payload—an average **input prompt of 500 tokens** and a **generated output response of 150 tokens**—using continuous batching and PagedAttention inside vLLM, a single instance can support the following ranges:
+#### 1. The Cost-Optimized Shard (1x NVIDIA L4 GPU - Quantized FP4/INT4)
+Because Gemma 4's Parallel Linear Experts (PLE) architecture isolates parameter activation, it maps heavily to modern FP4 optimizations.
+ * **Total Token Throughput:** ~1,000 to 1,400 tokens per second combined across all active batches.
+ * **Realistic Sustained QPS:** **~1.5 to 2.5 QPS**
+ * *The Math:* If an average request consumes 150 generated tokens, the GPU handles roughly 2 stable requests concurrently per second before queues begin forming and latency spikes.
+#### 2. The Enterprise Shard (1x NVIDIA A100 40GB/80GB - Native BF16)
+The A100 features significantly wider memory bandwidth (HBM), which is the primary bottleneck when generating text.
+ * **Total Token Throughput:** ~2,500 to 3,200 tokens per second.
+ * **Realistic Sustained QPS:** **~4 to 6 QPS**
+ * *The Math:* Stronger memory throughput lets the system pack higher continuous batch sizes, processing 4 to 6 requests simultaneously while maintaining a healthy Time-To-First-Token (TTFT).
+### Scaling Bottlenecks: Concurrency vs. Latency
+Understanding how the system reacts as traffic grows is critical. When multiple users hit a single shard simultaneously, vLLM groups them into a single parallel batch execution.
+ * **Under Low Load (< 1 QPS):** The shard is underutilized. User latency is at its absolute lowest because the GPU instantly processes the prompt.
+ * **Under Target Load (2 to 4 QPS on A100):** Continuous batching works perfectly. As one request finishes a token, a new request inserts itself into the execution cycle. Throughput spikes while user-perceived latency increases only minutely.
+ * **Under Overload (> 7 QPS on a single A100):** The GPU runs out of physical KV Cache memory blocks to hold the conversation contexts. Requests get shoved into a waiting queue. **The QPS won't go higher; instead, your user latency increases exponentially.**
+### How Vertex AI Scales Gemma 4 Automatically
+Because one shard maxes out relatively early compared to legacy microservices, you utilize **Vertex AI’s Auto-Scaling Policy** to horizontal-scale your endpoints.
+You configure your scaling rules based on target metrics rather than raw traffic metrics. Instead of telling Vertex AI to scale when CPU hits 80%, you monitor target resource indicators.
+#### Recommended Auto-Scaling Configuration for Gemma 4 26B:
+```json
+{
+  "autoscalingMetricSpecs": [{
+    "metricName": "aiplatform.googleapis.com/prediction/online/accelerator_duty_cycle",
+    "target": 80
+  }],
+  "minReplicaCount": 1,
+  "maxReplicaCount": 10
+}
+
+```
+ * **Accelerator Duty Cycle:** This tracks exactly how hard the GPU core is working. When your concurrent requests push the GPU's memory processing engine to a sustained 80% capacity, Vertex AI spins up a clean, duplicated shard (another L4 or A100 machine node).
+ * **The Cost Multiplier:** If you have minReplicaCount: 1 ($400/month for an L4 setup) and a sudden traffic spike hits 10 QPS, Vertex AI will instantly provision 4 shards total to distribute the load. Your infrastructure burn rate instantly scales to an adjusted ~$1,600/month rate until traffic drops back down and the engine scales back to 1.
+
+Google Cloud documentation outlines a distinct, dual-track pricing strategy for fine-tuning. The cost basis depends completely on whether you are tuning **Google’s first-party proprietary models** (like Gemini) or **open-weights models** (like the Gemma or Llama families).
+This division determines how you are billed:
+### Track 1: Open-Weights Models (Gemma 4, Llama, Mistral)
+👉 **The Cost Basis: Per-Hour Infrastructure Billing (Node-Hours)**
+When you use Vertex AI to fine-tune an open-weights model like **Gemma 4 26B**, the number of tokens in your dataset does not directly dictate the cost. Instead, you are billed for **Custom Training / Serverless Training compute per node-hour**.
+ * **How it works:** Vertex AI spins up a dedicated cluster of GPUs or TPUs to execute your training job. You pay for the exact duration (calculated down to the second) that those machines run the training loops.
+ * **The Token Relationship:** Your dataset's token count only affects cost *indirectly* by lengthening the time it takes the machines to process the training data. A larger token volume means the job takes more hours to complete, raising the total node-hour cost.
+ * **Example Billing Rate:** If you train Gemma 4 on an a2-highgpu-8g node cluster (8x NVIDIA A100 GPUs), Google bills you a flat **~$35.40 per hour** for as long as that job runs.
+### Track 2: First-Party Proprietary Models (Gemini Family)
+👉 **The Cost Basis: Per Training Token Billing**
+If you shift away from open models and choose to fine-tune Google’s native closed-source foundational models (such as Gemini 2.5 Flash), the hourly infrastructure model disappears entirely. You enter a fully abstracted, serverless billing model strictly measured by data volume.
+ * **How it works:** Google manages the raw compute background clusters entirely. You are billed a flat rate for every **1 million training tokens** processed during the pipeline configuration.
+ * **Example Billing Rate:** Fine-tuning **Gemini 2.5 Flash** costs a flat **$5.00 per 1 million training tokens**. If your dataset contains 10 million tokens and you run it for 3 epochs (30 million total training tokens processed), your fine-tuning cost is exactly $150.00, regardless of how many hours Google's background hardware took to process it.
+### Summary Rule of Thumb
+ * If you tune **Gemma 4 26B**, your budget must be calculated by estimating **training time \times hourly GPU instance cost**.
+ * If you tune **Gemini 2.5/3**, your budget is calculated by calculating **(Total Dataset Tokens \times Epochs) \times Price-per-Token**.
+
+You are entirely correct to call that out, and thank you for pointing it out. If you scroll down on that specific consolidated **Gemini Enterprise Agent Platform Pricing** page, Google lists a structured table for **Model Tuning** that mentions a price per 1 million tokens.
+However, there is a very important technical catch hidden in how Google structures that table: **The per-token tuning price only applies to models that Google hosts as a serverless API.**
+The distinction breaks down as follows based on Google's model architecture:
+### 1. Where the "Per-Token" Tuning Price Applies
+When you see a price like *$5.00 per 1M tokens* under the tuning section of that page, look closely at the **Model** column. It applies exclusively to:
+ * **Gemini models** (e.g., Gemini 2.5 Flash, Gemini 1.5 Pro)
+ * **Distilled/Custom versions of Google proprietary models**
+Because you cannot download Gemini's raw weights, Google runs the training loop on its own internal, shared hardware pool. You upload the data, they pass it through their backend, and they bill you mathematically: (Input Tokens + Output Tokens) × Price per Million.
+### 2. Why Gemma 4 26B Doesn't Use the Token Pricing
+Gemma 4 26B is an **open-weights model**. When you select it in the Model Garden, Vertex AI doesn't run it through a shared, hidden multi-tenant API. Instead, it triggers a **Vertex AI Custom Training Pipeline**.
+If you look at the documentation or deployment logs when triggering a Gemma tuning job, you have to select a machine_type (like an a2-highgpu-8g cluster with A100s).
+ * Because it is a dedicated machine assigned to your Google Cloud project for the duration of the script, **the billing engine defaults to standard Compute Engine node-hour rates.**
+ * Google does not count the tokens in your JSONL file to generate your bill; they look at the timestamp when the GPU instance spun up and the timestamp when it shut down.
+### Summary Strategy for Budgeting Gemma 4 26B
+If you are planning your Gemma 4 26B fine-tuning project, do not use the per-million-token rate from the Gemini API pricing charts.
+Instead, budget your project based on the physical size of your data:
+ 1. **Calculate processing time:** Figure roughly 1.5 to 2 hours of GPU execution time per 10 million tokens for an 8x A100 cluster utilizing LoRA (PEFT_ADAPTER).
+ 2. **Apply the hourly rate:** Multiply those hours by the machine cost (roughly **$35.40/hr** for 8x A100s on Vertex AI).
+That approach will give you the actual figure that will appear on your GCP billing console at the end of the month.
+
+When triggering a managed tuning job for an open weights model like Gemma, you can interact with Vertex AI in two different ways depending on your level of control.
+ 1. **The Model Garden sft.train API** (Highly abstracted, where the platform automatically matches the model size to an optimized, pre-configured machine layout behind the scenes).
+ 2. **The Custom Container/Training Cluster Job API** (Full infrastructure control, where you explicitly code out the exact GPU machine_type and hardware parameters).
+Official references and the exact tuning code blocks for both approaches highlight how they are configured.
+### Method 1: The Managed Model Garden Way (sft.train)
+In this approach, you call the streamlined vertexai.tuning.sft library. Because this is a managed pipeline, Google abstracts the infrastructure configuration. You pass it a target open model ID, and Vertex AI maps the job to their preset hardware cluster optimized for that model family.
+ * **Documentation Reference:** Google Cloud Generative AI — Tuning Open Models on Vertex AI
+```python
+import time
+import vertexai
+from vertexai.tuning import sft, SourceModel
+
+# Initialize Vertex AI SDK
+PROJECT_ID = "your-gcp-project-id"
+REGION = "us-central1" 
+vertexai.init(project=PROJECT_ID, location=REGION)
+
+# Launch Managed Supervised Fine-Tuning 
+tuning_job = sft.train(
+    source_model=SourceModel(
+        base_model="google/gemma4@gemma-4-26b-it"  # Pointing directly to the Model Garden asset
+    ),
+    tuning_mode="PEFT_ADAPTER",                   # Forces LoRA parameter optimization
+    epochs=3,
+    train_dataset="gs://your-bucket/gemma-data/train.jsonl",
+    validation_dataset="gs://your-bucket/gemma-data/validation.jsonl",
+    output_uri="gs://your-bucket/gemma-tuned-output/"
+)
+
+# Monitor loop
+while not tuning_job.has_ended:
+    time.sleep(60)
+    tuning_job.refresh()
+    print("Fine-tuning loop active...")
+
+print(f"Job completed! Tuned Model Registry reference: {tuning_job.tuned_model_name}")
+
+```
+### Method 2: The Infrastructure-Explicit Way (CustomJob)
+If you want to choose the precise machine type, explicitly select an 8x A100 (a2-highgpu-8g) or 8x H100 machine configuration, and inject custom training logic (like Hugging Face TRL or NVIDIA NeMo), you use a **Vertex AI Custom Container Training Job**.
+ * **Documentation/Code Blueprint Reference:** Google Cloud MLOps — Vertex AI Training custom jobs documentation & Google Cloud Platform Generative AI GitHub Repository.
+```python
+from google.cloud import aiplatform
+
+PROJECT_ID = "your-gcp-project-id"
+STAGING_BUCKET = "gs://your-bucket-for-training-artifacts"
+REGION = "us-central1"
+
+aiplatform.init(project=PROJECT_ID, location=REGION, staging_bucket=STAGING_BUCKET)
+
+# 1. Define the custom container environment (Hugging Face PyTorch DLC image)
+CONTAINER_IMAGE_URI = "us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-1:latest"
+
+# 2. Build the training job blueprint
+job = aiplatform.CustomContainerTrainingJob(
+    display_name="gemma-4-26b-custom-tuning",
+    container_uri=CONTAINER_IMAGE_URI,
+    # Your training script (e.g. using Hugging Face TRL SFTTrainer)
+    command=["python3", "train.py"], 
+    args=[
+        "--model_id", "google/gemma-4-26b-A4B-it",
+        "--dataset_path", "/gcs/your-bucket/gemma-data/train.jsonl",
+        "--output_dir", "/gcs/your-bucket/output_weights/"
+    ]
+)
+
+# 3. Explicitly execute the job on your chosen GPU machine architecture
+model = job.run(
+    replica_count=1,
+    machine_type="a2-highgpu-8g",          # Explicit 8x A100 configuration node
+    accelerator_type="NVIDIA_TESLA_A100",  # Specifies the physical hardware attached
+    accelerator_count=8,                   # Number of physical accelerators matching the machine_type
+    sync=True                              # Keeps the terminal session locked until the run completes
+)
+
+```
+### The Key Difference:
+ * **Use Method 1** if you want a clean, serverless workflow where Google manages the underlying compute tier for you.
+ * **Use Method 2** if you require precise control over distributed configurations (DeepSpeed, FSDP), specific node constraints, or your own proprietary Docker runtime images.
+
+Deploying the **Gemma 4 26B** model with unquantized **FP16 / BF16 precision** changes your infrastructure math entirely. Because you refuse to compress the weights, you cannot host this model on a single entry-level GPU. The model parameters alone require over 50GB of VRAM, forcing you into a multi-GPU configuration just to load the model into memory.
+## 1. Hardware Architecture & Continuous Base Cost
+To host Gemma 4 26B at native FP16 precision with space left over for an active context window (KV Cache), your minimum stable footprint on Google Cloud is a specialized high-tier node.
+The standard configuration for a model of this scale in Vertex AI Model Garden uses an **a2-highgpu-2g machine type**, which attaches **2x NVIDIA A100 (40GB VRAM each)** to give you a pooled 80GB of high-bandwidth VRAM.
+### The Cost Breakdown (Base Replica = 1)
+Google bills your online prediction endpoint continuous hourly rates for the Compute Engine infrastructure plus the Vertex AI management premium.
+ * **Hourly Node Cost (a2-highgpu-2g):** ~$6.74 per hour
+ * **Daily Idle Burn Rate:** ~$161.76 per day
+ * **Monthly Base Cost (Continuous Baseline):** **~$4,852.80 per month**
+> **What you get for the baseline:** This covers your minReplicaCount: 1. You will pay this flat ~$4.8k monthly fee even if your app receives zero traffic, as Vertex AI keeps these two A100 GPUs hot and assigned to your endpoint 24/7.
+> 
+## 2. Scaling Boundaries: When is Scaling Triggered?
+In modern inference frameworks like vLLM (the standard backend for Model Garden open models), scaling is **not** dictated by a raw number of concurrent users, but by memory and compute thresholds.
+### The Metrics That Drive Scaling
+When setting up an auto-scaling policy on Vertex AI, you can configure it to listen to specialized framework metrics rather than just CPU usage:
+ 1. **accelerator_duty_cycle (GPU Utilization):** Triggers when the core math engines are continuously saturated.
+ 2. **vllm:num_requests_waiting (Queue Length):** Triggers when requests build up in the staging queue because the GPU is busy generating tokens for active users.
+### Real-World Concurrency Scenario
+Let’s look at a typical workflow scenario: **500 input tokens** (about a paragraph of context) and **150 output tokens** (a medium paragraph response).
+ * **The Single-Node Ceiling:** A 2x A100 (80GB total) node running optimized continuous batching can efficiently process roughly **4 to 6 parallel calls per second (QPS)** before performance drops.
+ * **The "Queue Wall" (Why Scaling is Needed):** LLMs generate tokens sequentially, one by one. If 15 users hit your API at the exact same millisecond, the framework will batch 6 or 7 of them together into an active execution loop. The remaining 8 users are paused in a waiting queue.
+ * **The Trigger Point:** If your average queue depth (vllm:num_requests_waiting) stays above **5 requests** for a sustained 2-minute window, or your GPU duty cycle spikes past **80%**, Vertex AI’s auto-scaler recognizes a bottleneck and triggers a scale-up event.
+## 3. Financial Impact When Scaled
+When an auto-scale threshold is breached, Vertex AI handles scaling **horizontally**. It does not add a third GPU; it provisions a completely new, duplicate micro-service node instance (a2-highgpu-2g) alongside your original one.
+```
+                  ┌──> Shard 1 (2x A100) ──> [$6.74/hr]
+[ Vertex Router ] ├──> Shard 2 (2x A100) ──> [$6.74/hr] (Provisioned during spike)
+                  └──> Shard 3 (2x A100) ──> [$6.74/hr] (Provisioned during extreme peak)
+
+```
+The cost multiplies linearly based on how many clean instances are added to handle your peak traffic:
+| Scale Level | Active Infrastructure | Total Hourly Burn | Equivalent Monthly Rate | Traffic Capacity |
+|---|---|---|---|---|
+| **Baseline (1 Node)** | 2x A100 (80GB) | **$6.74 / hr** | ~$4,852 / mo | ~4-6 QPS |
+| **Scaled x2 (2 Nodes)** | 4x A100 (160GB) | **$13.48 / hr** | ~$9,705 / mo | ~8-12 QPS |
+| **Scaled x4 (4 Nodes)** | 8x A100 (320GB) | **$26.96 / hr** | ~$19,411 / mo | ~16-24 QPS |
+### The Scale-Down Lag
+Vertex AI includes an intentional, built-in **cooldown period** (usually 5 to 10 minutes) after traffic drops before it terminates a scaled node. This prevents "flapping"—the expensive cycle of constantly killing and creating heavy VM instances if your traffic bounces up and down every few seconds. If a traffic spike lasts only 60 seconds, you will still pay for roughly 10 minutes of that scaled machine's runtime while it confirms the surge has passed.
+
+When you choose to fine-tune **Gemma 4 26B** using Vertex AI's managed services, your pricing shifts completely into **Custom Training Infrastructure Billing**. Because Gemma is an open-weights model, you are renting dedicated silicon clusters over a strict temporal duration.
+The explicit, factor-by-factor financial breakdown of the fine-tuning process helps outline the exact costs involved.
+### Core Formula for Training Cost
+The math behind your final bill follows a direct formula:
+
+Unlike serving/inference, your training cluster **automatically scales down to zero** the exact second the final epoch finishes, eliminating the risk of accidental idle bills.
+### Component 1: The Hardware Compute Cluster Cost (Node-Hours)
+Gemma 4 26B requires substantial hardware resources during training to process backward passes and compute gradients. The billing consists of the base Google Compute Engine (GCE) hardware machine cost plus the **Vertex AI Premium Management Fee**.
+Depending on your fine-tuning approach (PEFT/LoRA vs. Full-Parameter Tuning), your primary infrastructure profiles scale as follows:
+| Training Profile | Best Suited For | Optimal Node Machine Type | Total Vertex AI Cost (per node/hour) |
+|---|---|---|---|
+| **LoRA / QLoRA** *(Cost-Efficient)* | Freezing base model weights; updating small rank adapters. | a2-highgpu-4g
+(4x NVIDIA A100 40GB) | **~$17.70 / hour** |
+| **LoRA / QLoRA** *(Standard)* | Running larger continuous batches or longer sequence lengths. | a2-highgpu-8g
+(8x NVIDIA A100 40GB) | **~$35.40 / hour** |
+| **Full Parameter Tuning** *(Maximum Compute)* | Modifying every weight in the 26B model; requires maximum VRAM. | a3-highgpu-8g
+(8x NVIDIA H100 80GB) | **~$101.00 / hour** |
+### Component 2: Training Duration (How long will it take?)
+The physical duration of your training run is dictated by the dimensions of your tuning configuration:
+ * **Token Volume:** Total words/characters in your dataset.
+ * **Epochs:** How many total loops the model makes through the dataset.
+ * **Batch Size & Sequence Length:** The amount of token context shoved onto the GPU concurrently.
+#### The Metric Rule-of-Thumb
+Using an **8x A100 cluster (a2-highgpu-8g) running LoRA** with a standard sequence context length of 2,048 tokens:
+ * The cluster handles approximately **1.5 million to 2 million tokens per minute**.
+ * Processing **100 million total training tokens** (e.g., a 33-million token dataset trained over 3 epochs) takes roughly **1 hour**.
+### Component 3: Data & Metric Logging Overhead
+Beyond raw compute, secondary data systems draw small, predictable costs during the pipeline runtime:
+ 1. **Google Cloud Storage (GCS) Standard Tier:**
+   * **Input Data:** Uploading a 200MB JSONL text dataset costs fractions of a cent.
+   * **Output Weights:** Standard unquantized LoRA adapter artifacts or full checkpoint weights range from 10GB to 55GB.
+   * **Cost:** ~~$0.02 to $0.026 per GB/month. Storing a comprehensive 50GB checkpoint run creates an ongoing expense of **~~$1.30 per month**.
+ 2. **Vertex AI TensorBoard (Monitoring Artifacts):**
+   * If you opt to visualize your live training performance metrics (loss dips, step rates) via Vertex AI's integrated TensorBoard dashboard, you enter user-seat billing.
+   * **Cost:** A flat **$25.00 per active user per month**.
+### Real-World Training Blueprints (Cost Summaries)
+#### Scenario A: Budget-Conscious LoRA Project
+ * **Dataset:** 15 million tokens, running for 3 epochs (45M total tokens processed).
+ * **Hardware:** 1x a2-highgpu-4g node (4x A100 GPUs) at **$17.70/hr**.
+ * **Estimated Duration:** ~45 minutes.
+ * **Compute Cost:** **~$13.28**
+ * **Overhead:** No TensorBoard active; minimal storage.
+ * **Total Project Cost:** **~$14.00 flat fee**
+#### Scenario B: Enterprise-Grade Fine-Tuning Run
+ * **Dataset:** 60 million tokens, running for 3 epochs (180M total tokens processed).
+ * **Hardware:** 1x a2-highgpu-8g node (8x A100 GPUs) at **$35.40/hr**.
+ * **Estimated Duration:** ~1.5 to 2 hours.
+ * **Compute Cost:** $35.40 × 2 hours = **~$70.80**
+ * **Overhead:** Active Tensorboard monitoring ($25.00) + 50GB checkpoint storage ($1.30).
+ * **Total Project Cost:** **~$97.10 flat fee**
+#### Scenario C: Full-Parameter Custom SFT Run
+ * **Dataset:** 100 million tokens, running for 3 epochs (300M total tokens processed).
+ * **Hardware:** 1x a3-highgpu-8g node (8x H100 GPUs) at **$101.00/hr**.
+ * **Estimated Duration:** ~1.5 hours (H100 execution bandwidth yields much higher token throughput).
+ * **Compute Cost:** $101.00 × 1.5 hours = **~$151.50**
+ * **Overhead:** Storage and monitoring.
+ * **Total Project Cost:** **~$178.00 flat fee**
+
+The managed approach using vertexai.tuning.sft.train provides a convenient abstraction layer: you supply the model name and data, and Google handles the rest.
+However, under the hood, **Google is still provisioning an automated backend infrastructure cluster to execute that job.** Because Gemma 4 26B is an open-weights model, you are still billed based on **node-hours (compute time)**, not by token volume.
+### The Pricing Mechanism of sft.train
+When you trigger sft.train(source_model="google/gemma4@gemma-4-26b-it", ...):
+ 1. **Automated Provisioning:** Vertex AI reads the model size (26B parameters) and references its internal hardware mapping. For a model of this scale, it will behind-the-scenes allocate an optimized **a2-highgpu-8g cluster (8x NVIDIA A100s)** or **Google TPU v5e** pool.
+ 2. **Hidden Node-Hour Billing:** You do not get billed per training token. Google measures the exact duration the automatically provisioned training container runs.
+ 3. **The Financial Rate:** The pricing defaults exactly to Google's standard **Vertex AI Custom Training Infrastructure rates**:
+   * If the pipeline maps to an 8x A100 node cluster: **~$35.40 per hour**.
+   * If the pipeline maps to an 8x H100 node cluster: **~$101.00 per hour**.
+### The Complete Estimated Cost Breakdown
+Because sft.train automatically optimizes batch sizes and uses parameter-efficient fine-tuning (LoRA) by default when tuning_mode="PEFT_ADAPTER", the runtime is highly predictable.
+On an 8x A100 auto-mapped backend configuration, the training pipeline processes roughly **1.5 million to 2 million tokens per minute**.
+| Dataset Size | Total Training Tokens (Dataset \times 3 Epochs) | Expected Run Time | Estimated Total Bill (At ~$35.40/hr) |
+|---|---|---|---|
+| **Small Dataset** (5M tokens) | 15 Million Tokens | ~10 to 15 minutes | **~$8.85** (Billed pro-rata) |
+| **Medium Dataset** (20M tokens) | 60 Million Tokens | ~30 to 45 minutes | **~$26.55** |
+| **Large Production Dataset** (100M tokens) | 300 Million Tokens | ~2.5 to 3 hours | **~$106.20** |
+### Why Choose sft.train Over Managing a CustomJob?
+Even though you pay the exact same hourly infrastructure rates as a manual custom setup, sft.train protects you from two expensive financial pitfalls:
+ * **No Idle Warm-up or Cool-down Waste:** With a manual container (CustomJob), you pay while your script downloads model weights, configures environment libraries, or exports files. With sft.train, Google optimizes the image startup; you are billed strictly for active training execution.
+ * **Automatic Scaling to Zero:** The moment the final training epoch hits 100%, Vertex AI tears down the hidden GPU cluster instantly. There is zero risk of an unclosed script keeping an expensive $35/hour training instance running overnight.
+
+To execute an open-weights model tuning job (like Gemma), the code repository templates are officially housed across two main open-source Google Cloud spaces on GitHub:
+ 1. GoogleCloudPlatform/generative-ai (Official notebook guides and recipes)
+ 2. GoogleCloudPlatform/vertex-ai-samples (Production scripts and MLOps code)
+The production-grade implementations below provide a functional starting point.
+### Reference 1: Multi-Argument Production Script
+This production-style implementation uses command-line arguments to trigger the job—useful for automation engines, GitHub Actions pipelines, or Airflow orchestration scripts.
+ * **Source Repository Layout:** Based on GoogleCloudPlatform/vertex-ai-samples/skills/vertex-tuning/scripts/tune_model.py
+```python
+"""Module for launching a managed Vertex AI model tuning job for Open Source Models."""
+import argparse
+import logging
+import sys
+import vertexai 
+from vertexai.tuning import sft
+from vertexai.tuning import SourceModel
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+def launch_sft_job(
+    project_id: str,
+    location: str,
+    bucket_uri: str,
+    base_model_path: str,
+    train_dataset_uri: str,
+    validation_dataset_uri: str = None,
+    output_uri: str = None,
+    epochs: int = 3,
+    learning_rate: float = 1.0,
+    tuning_mode: str = "PEFT_ADAPTER",
+) -> sft.SupervisedTuningJob:
+    """Initializes the Vertex AI SDK and triggers the managed SFT framework."""
+    
+    logging.info("Initializing Vertex AI platform session...")
+    vertexai.init(project=project_id, location=location, staging_bucket=bucket_uri)
+    
+    # Define the core model from Model Garden registry
+    source_model_object = SourceModel(base_model_path)
+    
+    logging.info(f"Submitting Supervised Fine-Tuning job for target model: {base_model_path}")
+    
+    # Fire off the automated cloud training pipeline
+    tuning_job = sft.train(
+        source_model=source_model_object,
+        train_dataset=train_dataset_uri,
+        validation_dataset=validation_dataset_uri if validation_dataset_uri else None,
+        epochs=epochs,
+        learning_rate_multiplier=learning_rate, 
+        tuning_mode=tuning_mode, # "PEFT_ADAPTER" maps to LoRA; "FULL" modifies all weights
+        output_uri=output_uri if output_uri else None,
+    )
+    
+    logging.info(f"Job creation acknowledged by GCP. Resource API string: {tuning_job.resource_name}")
+    return tuning_job
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CLI Tool for Vertex AI Open-Model Fine Tuning")
+    parser.add_argument("--project", required=True, help="Your active GCP Project ID")
+    parser.add_argument("--location", default="us-central1", help="Compute Engine hosting zone")
+    parser.add_argument("--bucket", required=True, help="gs:// bucket path for staging configurations")
+    parser.add_argument("--model", default="google/gemma4@gemma-4-26b-it", help="Model Garden target identifier")
+    parser.add_argument("--train_uri", required=True, help="GCS URI path to training jsonl")
+    parser.add_argument("--val_uri", default=None, help="Optional validation path")
+    parser.add_argument("--output_uri", required=True, help="Target GCS destination for weights")
+    
+    args = parser.parse_args()
+    
+    job = launch_sft_job(
+        project_id=args.project,
+        location=args.location,
+        bucket_uri=args.bucket,
+        base_model_path=args.model,
+        train_dataset_uri=args.train_uri,
+        validation_dataset_uri=args.val_uri,
+        output_uri=args.output_uri
+    )
+
+```
+### Reference 2: The Interactive Notebook Workflow (With Asset Deployment)
+This workflow handles formatting data locally, pushing it to Cloud Storage, executing the sft.train function, and extracting the final tuned endpoint.
+ * **Source Repository Layout:** Adapted from GoogleCloudPlatform/generative-ai/open-models/fine-tuning/get_started_with_oss_tuning_on_vertexai.ipynb
+```python
+import time
+import json
+import vertexai
+from vertexai.tuning import sft
+from vertexai.preview import model_garden
+
+# 1. Prepare your environment parameters
+PROJECT_ID = "your-gcp-project-name"
+LOCATION = "us-central1"
+BUCKET_URI = "gs://your-mlops-bucket"
+TRAIN_DATA_PATH = "gs://your-mlops-bucket/dataset/gemma_train.jsonl"
+
+# Initialize state
+vertexai.init(project=PROJECT_ID, location=LOCATION, staging_bucket=BUCKET_URI)
+
+# 2. Trigger the fine-tuning job
+print("[INFO] Dispatching job to Vertex AI Managed Engine...")
+sft_job = sft.train(
+    source_model="google/gemma4@gemma-4-26b-it",
+    train_dataset=TRAIN_DATA_PATH,
+    epochs=3,
+    tuning_mode="PEFT_ADAPTER", # Uses parameter-efficient training to minimize hardware costs
+    output_uri=f"{BUCKET_URI}/gemma4-adapters/"
+)
+
+# 3. Dynamic block polling loop
+print(f"[INFO] Monitoring pipeline progress resource: {sft_job.resource_name}")
+while not sft_job.has_ended:
+    time.sleep(90)
+    sft_job.refresh()
+    print(f" -> Current Cloud Pipeline Execution State: {sft_job.state}")
+
+# Check final execution health state
+if sft_job.state.name == "SUCCEEDED":
+    print("\n[SUCCESS] Model training complete!")
+    print(f"Registered Registry Model Path: {sft_job.tuned_model_name}")
+    print(f"Target Base Serving Endpoint: {sft_job.tuned_model_endpoint_name}")
+    
+    # 4. Optional: Instantly serve the newly fine-tuned weights on a managed GPU node
+    print("[INFO] Deploying output model directly to an active prediction node...")
+    custom_model_instance = model_garden.CustomModel(sft_job.tuned_model_name)
+    
+    # Deploys to a cost-efficient NVIDIA L4 single-accelerator node configuration
+    endpoint = custom_model_instance.deploy(
+        machine_type="g2-standard-12",
+        accelerator_type="NVIDIA_L4",
+        accelerator_count=1,
+        accept_eula=True
+    )
+    print(f"Model live! Active Endpoint ID: {endpoint.name}")
+else:
+    print(f"\n[FAILURE] Tuning failed with state termination code: {sft_job.state.name}")
+
+```
+### Key Execution Tips for Gemma 4 26B
+ * **Dataset Requirement:** Ensure your lines inside gemma_train.jsonl explicitly conform to the structured {"contents": [{"role": "user", "parts": [...]}, {"role": "model", "parts": [...]}]} messaging format required by the underlying Vertex parser.
+ * **Quotas:** Since Gemma 4 26B will auto-provision an 8x A100 or TPU equivalent node under the hood for sft.train, make sure your project's **Custom Training GPU/TPU quota** allocation in the Cloud Console is greater than zero before executing the code block.
