@@ -1,63 +1,12 @@
-Image resolution :
+Stock-Out & Depletion Estimation
 
+Estimate item depletion by comparing the time since the last insertion with the item's historical replenishment pattern.
 
+Learn each item's typical insertion frequency and interval between insertions.
+Identify when the current gap significantly exceeds its normal pattern.
+Use this as an indicator of potential depletion or stock-out.
 
-media_resolution=types.PartMediaResolution(
-              level=types.PartMediaResolutionLevel.MEDIA_RESOLUTION_HIGH # High resolution
-          ),
+Example:
+Coca-Cola is typically inserted every 3–4 days. If no insertion is detected for 7+ days, the system can flag Coca-Cola as likely depleted and trigger a personalized replenishment recommendation.
 
-
-
-
-Thinking level :
-
-
-config=types.GenerateContentConfig(
-       thinking_config=types.ThinkingConfig(
-           thinking_level=types.ThinkingLevel.HIGH # Default, dynamic thinking
-       )
-   ),
-
-
-1. Thinking Level (New in Gemini 3)
-What Changed
-
-Gemini 2.5 used an implicit thinking_budget, where reasoning depth was controlled indirectly.
-
-Gemini 3 replaces this with an explicit thinking_level parameter, allowing direct control over internal reasoning effort.
-
-Thinking Levels Explained
-Level	Availability	Technical Meaning	Best Used For
-MINIMAL	Gemini 3 Flash only	Near-zero reasoning tokens; still enforces thought signatures	Simple, low-complexity tasks
-LOW	Gemini 3	Reduced reasoning tokens	High-throughput, latency-sensitive tasks
-MEDIUM	Gemini 3 Flash only	Balanced reasoning vs latency	Moderately complex tasks
-HIGH	Gemini 3 Flash & Pro (default)	Maximum reasoning tokens	Multi-step planning, agents, complex logic
-Technical Impact
-
-Developers can now explicitly trade reasoning quality against latency and cost.
-
-Reasoning behavior is predictable and reproducible, which is critical for production systems.
-
-Even minimal reasoning still enforces thought signatures, improving tool-calling reliability.
-
-2. Media Resolution Control (New in Gemini 3)
-What Changed
-
-Gemini 2.5 used fixed or opaque vision processing.
-
-Gemini 3 introduces media_resolution, which directly controls how many vision tokens are allocated per image, PDF page, or video frame.
-
-Resolution Levels and Token Budgets
-Resolution	Image Tokens	Video Tokens	PDF Tokens
-UNSPECIFIED (Default)	1120	70	560
-LOW	280	70	280 + text
-MEDIUM	560	70	560 + text
-HIGH	1120	280	1120 + text
-ULTRA_HIGH	2240	N/A	N/A
-Key Technical Notes
-
-Higher resolution = better fine-detail perception, but higher token usage and latency.
-
-ULTRA_HIGH is image-only and must be set per media item.
-
-PDFs are treated as vision inputs, and their tokens are now accounted under the IMAGE modality, not DOCUMENT.
+Key principle: Identify items that are expected but missing, rather than treating every absence as a stock-out.
