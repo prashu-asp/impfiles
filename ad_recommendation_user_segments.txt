@@ -1,0 +1,23 @@
+AD RECOMMENDATION — USER SEGMENTS
+========================================================================================================================
+
+          User Feature / Quality                                                      Observed Consumption                                                               Relevant Ads / Recommendations
+       High beverage consumption                       Coke, Pepsi, juices, energy drinks, flavored drinks                Beverage brands, new drink launches, beverage multipacks, drink subscriptions
+ High sugary-product consumption               Chocolates, cookies, ice cream, sugary cereals, soft drinks                 Desserts, chocolates, snack brands, new sweet-product launches, combo offers
+        High protein consumption       Protein milk, Greek yogurt, eggs, protein bars, high-protein snacks                  Protein drinks, protein bars, high-protein foods, sports nutrition products
+             Healthy consumption      Fruits, vegetables, salads, yogurt, low-sugar products, whole grains                  Healthy snacks, organic products, low-sugar alternatives, fresh-food brands
+Busy professional / ready-to-eat             Ready meals, frozen meals, instant foods, packaged sandwiches Ready-to-eat meals, meal subscriptions, quick-preparation foods, convenient grocery products
+                Frequent snacker                             Chips, biscuits, chocolates, nuts, snack bars                           New snacks, premium snacks, snack combos, subscription snack boxes
+            Dairy-heavy consumer                                              Milk, cheese, yogurt, butter                        Dairy brands, premium yogurt, cheese varieties, lactose-free products
+               Breakfast-focused                               Cereals, bread, milk, eggs, yogurt, spreads       Breakfast cereals, spreads, granola, breakfast drinks, ready-to-eat breakfast products
+            Frozen-food consumer                             Frozen pizza, fries, vegetables, frozen meals                                 Frozen-food brands, new frozen products, frozen meal bundles
+             Fresh-food consumer                             Fruits, vegetables, fresh dairy, fresh juices                                   Fresh-food brands, organic produce, premium fresh products
+    Low-sugar / health-conscious                Zero-sugar drinks, low-sugar snacks, high-protein products          Zero-sugar beverages, healthy snacks, functional foods, better-for-you alternatives
+                Premium consumer Premium chocolates, imported foods, premium beverages, specialty products                              Premium/novelty brands, gourmet foods, premium product launches
+     Family-oriented consumption         Large packs, milk, juices, cereals, snacks, family-sized products                         Family packs, bulk offers, kids' products, household grocery bundles
+ Vegetarian-oriented consumption                               Vegetables, paneer, tofu, plant-based foods                              Plant-based products, vegetarian ready meals, meat alternatives
+   Experimental / variety seeker                    Frequently tries new brands/products across categories                    New launches, limited editions, trending products, discovery/combo offers
+
+
+Recommendation principle:
+Consumption signals → User profile → Product affinity → Relevant ad
